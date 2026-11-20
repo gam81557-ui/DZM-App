@@ -1,0 +1,25 @@
+<resources>
+    <string name="app_name">DropZone Manager</string>
+    <string name="shizuku_status_connected">Shizuku Connected</string>
+    <string name="shizuku_status_permission_required">Permission Required</string>
+    <string name="shizuku_status_not_running">Shizuku Not Running</string>
+    <string name="action_grant">Grant</string>
+    <string name="action_open_shizuku">Open Shizuku</string>
+    <string name="action_switch_version">Switch</string>
+    <string name="action_refresh">Refresh</string>
+    <string name="action_retry">Retry</string>
+    <string name="action_download_and_apply">Download &amp; Apply</string>
+    <string name="action_overwrite">Overwrite</string>
+    <string name="action_cancel">Cancel</string>
+    <string name="version_selector_title">Select PUBG Edition</string>
+    <string name="version_selector_subtitle">Choose the target client package for Android/data deployment</string>
+    <string name="search_files_placeholder">Search configs, packs, or paths…</string>
+    <string name="badge_installed">Installed</string>
+    <string name="badge_not_installed">Not Installed</string>
+    <string name="overwrite_dialog_title">File Already Exists</string>
+    <string name="overwrite_dialog_message">A file already exists at the target location. Overwrite it with the downloaded file?</string>
+    <string name="maintenance_banner_title">Maintenance Mode</string>
+    <string name="maintenance_default_message">Downloads are temporarily paused for updates. Please check back shortly.</string>
+    <string name="announcement_banner_title">Notice</string>
+    <string name="catalog_error_title">Failed to Load Remote Config</string>
+</resources>

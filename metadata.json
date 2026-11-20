@@ -1,0 +1,6 @@
+{
+  "name": "DropZone Manager",
+  "description": "Tactical Dark PUBG file library & Shizuku-powered Android/data deployment utility",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
