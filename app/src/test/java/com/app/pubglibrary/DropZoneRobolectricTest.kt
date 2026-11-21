@@ -53,6 +53,7 @@ import com.app.pubglibrary.ui.DropZoneViewModel
 import com.app.pubglibrary.ui.ItemTransferState
 import com.app.pubglibrary.ui.LibraryFileCard
 import com.app.pubglibrary.ui.MainScreenContent
+import com.app.pubglibrary.ui.OverwritePrompt
 import com.app.pubglibrary.ui.SnackbarEvent
 import com.app.pubglibrary.ui.i18n.EnAppStrings
 import com.app.pubglibrary.ui.i18n.MmAppStrings
@@ -66,6 +67,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.toList
@@ -472,11 +474,11 @@ class DropZoneRobolectricTest {
                 targetSubPath = "",
                 fileName = "files.zip"
             )
-            val staged = File(tempRoot, "downloads/all/files.zip")
-            assertFalse(staged.exists())
             val stages = runBlocking { repository.downloadFile(item).toList() }
             assertTrue(stages.any { it is DownloadStage.Downloading && it.progress > 0f })
-            assertEquals(DownloadStage.Completed(staged), stages.last())
+            val staged = (stages.last() as DownloadStage.Completed).localFile
+            assertEquals("files.zip", staged.name)
+            assertTrue(staged.canonicalPath.startsWith(File(tempRoot, "downloads/all").canonicalPath + File.separator))
             val target = File(tempRoot, "target")
             val applied = staged.inputStream().use {
                 FileUserService().extractZip(DownloadFileSource(it), target.absolutePath)
@@ -489,6 +491,42 @@ class DropZoneRobolectricTest {
             assertEquals(EnAppStrings.errInvalidDownloadedZip, (failure as DownloadStage.Failed).message)
             assertTrue(staged.readBytes().contentEquals(archiveBytes))
             assertEquals(listOf("files.zip"), staged.parentFile?.list()?.toList())
+        } finally {
+            server.stop(0)
+            tempRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `items sharing a filename retain their own downloaded content`() {
+        val tempRoot = createTempDirectory(prefix = "dropzone_item_staging").toFile()
+        val context = object : ContextWrapper(ApplicationProvider.getApplicationContext<Context>()) {
+            override fun getFilesDir(): File = tempRoot
+        }
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        for ((path, content) in listOf("/one" to "FIRST", "/two" to "SECOND")) {
+            server.createContext(path) { exchange ->
+                val bytes = content.toByteArray()
+                exchange.sendResponseHeaders(200, bytes.size.toLong())
+                exchange.responseBody.use { it.write(bytes) }
+            }
+        }
+        server.start()
+        try {
+            val repo = FileRepository(context)
+            val item = LibraryFileItem(
+                id = "../first", title = "First", versionKey = "all", sizeLabel = "1 KB",
+                downloadUrl = "http://127.0.0.1:${server.address.port}/one",
+                targetSubPath = "", fileName = "files.pak"
+            )
+            val second = item.copy(id = "second", downloadUrl = "http://127.0.0.1:${server.address.port}/two")
+            val firstFile = (runBlocking { repo.downloadFile(item).toList().last() } as DownloadStage.Completed).localFile
+            val secondFile = (runBlocking { repo.downloadFile(second).toList().last() } as DownloadStage.Completed).localFile
+            assertTrue(firstFile != secondFile)
+            assertTrue(firstFile.canonicalPath.startsWith(File(tempRoot, "downloads").canonicalPath + File.separator))
+            assertEquals("FIRST", firstFile.readText())
+            assertEquals("SECOND", secondFile.readText())
+            assertEquals(firstFile, (runBlocking { repo.downloadFile(item).toList().last() } as DownloadStage.Completed).localFile)
         } finally {
             server.stop(0)
             tempRoot.deleteRecursively()
@@ -1169,6 +1207,25 @@ class DropZoneRobolectricTest {
                     }
                     checkNotNull(readyState) { "Timed out waiting for preferences and the test catalog in uiState" }
                     if (gated) {
+                        // A pending overwrite must keep its staged file until the user decides.
+                        val field = DropZoneViewModel::class.java.getDeclaredField("_pendingOverwrite")
+                        field.isAccessible = true
+                        @Suppress("UNCHECKED_CAST")
+                        val pending = field.get(viewModel) as MutableStateFlow<OverwritePrompt?>
+                        val prompt = OverwritePrompt(item, PubgVersion.GLOBAL, "staged", "target", "target/file", false)
+                        pending.value = prompt
+                        var adRequested = false
+                        viewModel.downloadAndApply(item) {
+                            adRequested = true
+                            RewardedAdResult.COMPLETED
+                        }
+                        runCurrent()
+                        assertFalse(adRequested)
+                        assertEquals(prompt, viewModel.uiState.value.pendingOverwrite)
+                        assertTrue(viewModel.uiState.value.transferStates.isEmpty())
+                        pending.value = null
+                        runCurrent()
+
                         for ((outcome, message) in listOf(
                             RewardedAdResult.SKIPPED to EnAppStrings.msgRewardedAdSkipped,
                             RewardedAdResult.UNAVAILABLE to EnAppStrings.msgRewardedAdUnavailable,

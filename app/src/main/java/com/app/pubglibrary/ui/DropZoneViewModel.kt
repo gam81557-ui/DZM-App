@@ -527,7 +527,7 @@ class DropZoneViewModel(
         }
 
         val version = _selectedVersion.value ?: return
-        if (_transferStates.value.containsKey(item.id)) return
+        if (_transferStates.value.containsKey(item.id) || _pendingOverwrite.value != null) return
 
         if (item !in meta.items || !item.matchesVersion(version)) return
         if (meta.requireAdForDownload) {

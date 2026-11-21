@@ -28,6 +28,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.io.FileOutputStream
+import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 import java.util.zip.ZipException
 import java.util.zip.ZipFile
@@ -327,7 +328,10 @@ class FileRepository(private val context: Context) {
     fun downloadFile(item: LibraryFileItem): Flow<DownloadStage> = flow {
         val safeVersionFolder = item.versionKey.trim().ifEmpty { "all" }.lowercase()
         emit(DownloadStage.Downloading(0f))
-        val stagingDir = File(context.filesDir, "downloads/$safeVersionFolder")
+        val itemHash = MessageDigest.getInstance("SHA-256")
+            .digest(item.id.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        val stagingDir = File(context.filesDir, "downloads/$safeVersionFolder/$itemHash")
         if (!stagingDir.isDirectory && !stagingDir.mkdirs() && !stagingDir.isDirectory) {
             emit(DownloadStage.Failed(UiText.Localized { it.errCreateStagingDir }))
             return@flow
