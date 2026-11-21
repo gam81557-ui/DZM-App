@@ -21,13 +21,13 @@ internal object UnityDownloadAds {
     const val BANNER_PLACEMENT = "BP_Banner_Android"
     private const val REWARDED_PLACEMENT = "BP_Rewarded_Android"
     private const val LOAD_TIMEOUT_MS = 20_000L
-    private const val SHOW_TIMEOUT_MS = 180_000L
+    private const val SHOW_START_TIMEOUT_MS = 180_000L
     private val initialization = Mutex()
 
     suspend fun initialize(context: Context): Boolean = withContext(Dispatchers.IO) {
         withTimeoutOrNull(LOAD_TIMEOUT_MS) {
             initialization.withLock {
-                if (UnityAds.isInitialized) return@withLock true
+                if (UnityAdsInitialization.isInitialized()) return@withLock true
                 val result = CompletableDeferred<Boolean>()
                 UnityAds.initialize(context.applicationContext, GAME_ID, false,
                     object : IUnityAdsInitializationListener {
@@ -56,9 +56,12 @@ internal object UnityDownloadAds {
             !activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
         ) return RewardedAdResult.UNAVAILABLE
 
+        val startedOrFinished = CompletableDeferred<Unit>()
         val result = CompletableDeferred<RewardedAdResult>()
         UnityAds.show(activity, REWARDED_PLACEMENT, object : IUnityAdsShowListener {
-            override fun onUnityAdsShowStart(placementId: String) = Unit
+            override fun onUnityAdsShowStart(placementId: String) {
+                if (placementId == REWARDED_PLACEMENT) startedOrFinished.complete(Unit)
+            }
             override fun onUnityAdsShowClick(placementId: String) = Unit
 
             override fun onUnityAdsShowFailure(
@@ -67,6 +70,7 @@ internal object UnityDownloadAds {
                 message: String
             ) {
                 result.complete(RewardedAdResult.UNAVAILABLE)
+                startedOrFinished.complete(Unit)
             }
 
             override fun onUnityAdsShowComplete(
@@ -80,9 +84,15 @@ internal object UnityDownloadAds {
                         else -> RewardedAdResult.SKIPPED
                     }
                 )
+                startedOrFinished.complete(Unit)
             }
         })
-        return withTimeoutOrNull(SHOW_TIMEOUT_MS) { result.await() } ?: RewardedAdResult.UNAVAILABLE
+        if (withTimeoutOrNull(SHOW_START_TIMEOUT_MS) { startedOrFinished.await() } == null &&
+            !startedOrFinished.isCompleted
+        ) return RewardedAdResult.UNAVAILABLE
+
+        // MainActivity's lifecycle scope cancels this wait when the Activity is destroyed.
+        return result.await()
     }
 
     private suspend fun loadRewarded(): Boolean {

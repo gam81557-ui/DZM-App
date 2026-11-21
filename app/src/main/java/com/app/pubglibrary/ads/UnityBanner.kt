@@ -1,5 +1,8 @@
 package com.app.pubglibrary.ads
 
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -22,7 +25,9 @@ import com.unity3d.services.banners.UnityBannerSize
 @Composable
 internal fun UnityBanner() {
     val context = LocalContext.current
-    val initialized by produceState(false, context) { value = UnityDownloadAds.initialize(context) }
+    val activity = remember(context) { context.findActivity() } ?: return
+    if (activity.isFinishing || activity.isDestroyed) return
+    val initialized by produceState(false, activity) { value = UnityDownloadAds.initialize(activity) }
     if (!initialized) return
 
     BoxWithConstraints(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
@@ -32,8 +37,8 @@ internal fun UnityBanner() {
             if (!failed) {
                 AndroidView(
                     modifier = Modifier.width(320.dp).height(if (loaded) 50.dp else 0.dp),
-                    factory = { viewContext ->
-                        BannerView(viewContext, UnityDownloadAds.BANNER_PLACEMENT, UnityBannerSize(320, 50))
+                    factory = {
+                        BannerView(activity, UnityDownloadAds.BANNER_PLACEMENT, UnityBannerSize(320, 50))
                             .apply {
                                 listener = object : BannerView.Listener() {
                                     override fun onBannerLoaded(bannerView: BannerView) {
@@ -56,4 +61,10 @@ internal fun UnityBanner() {
             }
         }
     }
+}
+
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext?.findActivity()
+    else -> null
 }

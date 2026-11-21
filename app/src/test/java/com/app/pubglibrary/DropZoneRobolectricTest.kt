@@ -63,7 +63,9 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -948,7 +950,15 @@ class DropZoneRobolectricTest {
 
                 try {
                     viewModel.selectVersion(PubgVersion.GLOBAL)
-                    runCurrent()
+                    // DataStore runs on real IO, so use a real timeout for the first combined state.
+                    val readyState = withContext(Dispatchers.Default) {
+                        withTimeoutOrNull(5_000L) {
+                            viewModel.uiState.first {
+                                it.isNetworkVerified && it.hasLoadedRemoteOnce && item in it.visibleItems
+                            }
+                        }
+                    }
+                    checkNotNull(readyState) { "Timed out waiting for preferences and the test catalog in uiState" }
                     if (gated) {
                         for ((outcome, message) in listOf(
                             RewardedAdResult.SKIPPED to EnAppStrings.msgRewardedAdSkipped,
