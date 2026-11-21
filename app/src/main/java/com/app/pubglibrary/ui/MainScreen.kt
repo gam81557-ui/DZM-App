@@ -112,6 +112,7 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
@@ -152,7 +153,7 @@ import com.app.pubglibrary.data.InstalledPackageInfo
 import com.app.pubglibrary.data.LibraryFileItem
 import com.app.pubglibrary.data.PubgVersion
 import com.app.pubglibrary.data.RemoteNotice
-import com.app.pubglibrary.data.resolveThumbnailUrl
+import com.app.pubglibrary.data.resolveThumbnailUrls
 import com.app.pubglibrary.shizuku.ShizukuStatus
 import com.app.pubglibrary.ui.i18n.LocalAppStrings
 import com.app.pubglibrary.ui.i18n.NOTICE_CREDIT_MESSAGE
@@ -1585,8 +1586,8 @@ private fun FileLibraryScreen(
                     ) { item ->
                         LibraryFileCard(
                             item = item,
-                            thumbnailUrl = remember(item, thumbnails) {
-                                item.resolveThumbnailUrl(thumbnails)
+                            thumbnailUrls = remember(item, thumbnails) {
+                                item.resolveThumbnailUrls(thumbnails)
                             },
                             targetPathPreview = resolveTargetPreview(item),
                             transferState = transferStates[item.id],
@@ -1819,9 +1820,9 @@ private fun RemoteErrorState(
 }
 
 @Composable
-private fun LibraryFileCard(
+internal fun LibraryFileCard(
     item: LibraryFileItem,
-    thumbnailUrl: String?,
+    thumbnailUrls: List<String>,
     targetPathPreview: String,
     transferState: ItemTransferState?,
     wasApplied: Boolean,
@@ -1950,7 +1951,9 @@ private fun LibraryFileCard(
                         .border(1.dp, AmberSignal.copy(alpha = 0.4f), thumbnailShape),
                     contentAlignment = Alignment.Center
                 ) {
-                    var thumbnailLoaded by remember(thumbnailUrl) { mutableStateOf(false) }
+                    var thumbnailIndex by remember(thumbnailUrls) { mutableIntStateOf(0) }
+                    var thumbnailLoaded by remember(thumbnailUrls) { mutableStateOf(false) }
+                    val thumbnailUrl = thumbnailUrls.getOrNull(thumbnailIndex)
                     if (!thumbnailLoaded) {
                         Icon(
                             imageVector = fallbackIcon,
@@ -1963,8 +1966,21 @@ private fun LibraryFileCard(
                         AsyncImage(
                             model = thumbnailUrl,
                             contentDescription = null,
-                            modifier = Modifier.fillMaxSize(),
-                            onState = { thumbnailLoaded = it is AsyncImagePainter.State.Success },
+                            modifier = Modifier.fillMaxSize().testTag(
+                                if (thumbnailLoaded) "thumbnail_loaded_${item.id}" else "thumbnail_loading_${item.id}"
+                            ),
+                            onState = { state ->
+                                if (thumbnailUrls.getOrNull(thumbnailIndex) == thumbnailUrl) {
+                                    when (state) {
+                                        is AsyncImagePainter.State.Success -> thumbnailLoaded = true
+                                        is AsyncImagePainter.State.Error -> {
+                                            thumbnailLoaded = false
+                                            thumbnailIndex++
+                                        }
+                                        else -> Unit
+                                    }
+                                }
+                            },
                             contentScale = ContentScale.Crop
                         )
                     }

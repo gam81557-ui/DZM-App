@@ -6,7 +6,12 @@ import android.os.Build
 import androidx.compose.runtime.Immutable
 import com.app.pubglibrary.ui.i18n.EnAppStrings
 import com.app.pubglibrary.ui.i18n.UiText
+import com.squareup.moshi.FromJson
 import com.squareup.moshi.JsonClass
+import com.squareup.moshi.JsonQualifier
+import com.squareup.moshi.JsonReader
+import com.squareup.moshi.JsonWriter
+import com.squareup.moshi.ToJson
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import kotlinx.coroutines.CancellationException
@@ -118,23 +123,57 @@ data class RemoteNotice(
         enabled && !maintenance && (!canDismiss || id !in dismissedIds)
 }
 
-internal fun LibraryFileItem.resolveThumbnailUrl(thumbnails: Map<String, String>): String? {
-    if (thumbnails.isEmpty()) return null
-    for (key in listOf(id, fileName, title)) {
-        val url = thumbnails[key]?.trim()?.toHttpUrlOrNull()
-        if (url != null) return url.toString()
+internal fun LibraryFileItem.resolveThumbnailUrls(thumbnails: Map<String, String>): List<String> =
+    listOf(id, fileName, title).mapNotNull { key ->
+        thumbnails[key]?.trim()?.toHttpUrlOrNull()?.toString()
+    }.distinct()
+
+internal fun LibraryFileItem.resolveThumbnailUrl(thumbnails: Map<String, String>): String? =
+    resolveThumbnailUrls(thumbnails).firstOrNull()
+
+@JsonQualifier
+@Retention(AnnotationRetention.RUNTIME)
+annotation class ThumbnailMap
+
+/** Thumbnail metadata is optional and must not prevent the rest of the catalog loading. */
+class ThumbnailMapAdapter {
+    @FromJson
+    @ThumbnailMap
+    fun fromJson(reader: JsonReader): Map<String, String> {
+        if (reader.peek() != JsonReader.Token.BEGIN_OBJECT) {
+            reader.skipValue()
+            return emptyMap()
+        }
+        val thumbnails = mutableMapOf<String, String>()
+        reader.beginObject()
+        while (reader.hasNext()) {
+            val key = reader.nextName()
+            if (reader.peek() == JsonReader.Token.STRING) {
+                val value = reader.nextString().trim()
+                if (value.isNotEmpty()) thumbnails[key] = value
+            } else {
+                reader.skipValue()
+            }
+        }
+        reader.endObject()
+        return thumbnails
     }
-    return null
+
+    @ToJson
+    fun toJson(writer: JsonWriter, @ThumbnailMap thumbnails: Map<String, String>) {
+        writer.beginObject()
+        thumbnails.forEach { (key, value) -> writer.name(key).value(value) }
+        writer.endObject()
+    }
 }
 
-@JsonClass(generateAdapter = true)
 data class RemoteControlConfig(
     val maintenance: Boolean = false,
     val maintenanceMessage: String = "",
     val announcement: String = "",
     val files: List<LibraryFileItem> = emptyList(),
     val notice: RemoteNotice? = null,
-    val thumbnails: Map<String, String> = emptyMap(),
+    @ThumbnailMap val thumbnails: Map<String, String> = emptyMap(),
     val requireAdForDownload: Boolean = false
 )
 
@@ -172,6 +211,7 @@ class FileRepository(private val context: Context) {
 
     private val moshi: Moshi by lazy {
         Moshi.Builder()
+            .add(ThumbnailMapAdapter())
             .addLast(KotlinJsonAdapterFactory())
             .build()
     }

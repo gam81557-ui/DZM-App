@@ -4,9 +4,19 @@ import android.app.Application
 import android.content.Context
 import android.content.ContextWrapper
 import android.os.Looper
+import android.view.View
+import androidx.activity.ComponentActivity
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.test.getUnclippedBoundsInRoot
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.junit4.createComposeRule
@@ -20,6 +30,7 @@ import coil.request.ErrorResult
 import coil.request.ImageRequest
 import coil.request.SuccessResult
 import androidx.lifecycle.viewModelScope
+import com.app.pubglibrary.ads.BannerSlot
 import com.app.pubglibrary.ads.RewardedAdResult
 import com.app.pubglibrary.data.AppLanguage
 import com.app.pubglibrary.data.DownloadStage
@@ -32,6 +43,7 @@ import com.app.pubglibrary.data.REMOTE_CONTROL_URL
 import com.app.pubglibrary.data.RemoteCatalogResult
 import com.app.pubglibrary.data.RemoteNotice
 import com.app.pubglibrary.data.resolveThumbnailUrl
+import com.app.pubglibrary.data.resolveThumbnailUrls
 import com.app.pubglibrary.service.FileUserService
 import com.app.pubglibrary.shizuku.DownloadFileSource
 import com.app.pubglibrary.shizuku.ShizukuStatus
@@ -39,6 +51,7 @@ import com.app.pubglibrary.ui.DescriptionLine
 import com.app.pubglibrary.ui.DropZoneUiState
 import com.app.pubglibrary.ui.DropZoneViewModel
 import com.app.pubglibrary.ui.ItemTransferState
+import com.app.pubglibrary.ui.LibraryFileCard
 import com.app.pubglibrary.ui.MainScreenContent
 import com.app.pubglibrary.ui.SnackbarEvent
 import com.app.pubglibrary.ui.i18n.EnAppStrings
@@ -73,6 +86,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows
 import org.robolectric.annotation.Config
@@ -210,6 +224,34 @@ class DropZoneRobolectricTest {
     }
 
     @Test
+    fun `optional thumbnail data never blocks catalog and valid fallback keys are retained`() {
+        val repo = FileRepository(ApplicationProvider.getApplicationContext())
+        val file = """{"id":"file_01","title":"Pack","sizeLabel":"1 MB",
+            "downloadUrl":"https://example.com/files.zip","targetSubPath":"","fileName":"files.zip"}"""
+        for (value in listOf("null", "[]", "\"invalid\"")) {
+            val config = requireNotNull(repo.parseRemoteConfigJson(
+                """{"thumbnails":$value,"requireAdForDownload":true,"files":[$file]}"""
+            ))
+            assertTrue(config.thumbnails.isEmpty())
+            assertTrue(config.requireAdForDownload)
+            assertEquals("file_01", config.files.single().id)
+        }
+
+        val config = requireNotNull(repo.parseRemoteConfigJson(
+            """{"thumbnails":{"file_01":null,"files.zip":"  https://example.com/good.png  ",
+                 "Pack":"https://example.com/backup.png","bad":{},"empty":""},"files":[$file]}"""
+        ))
+        assertEquals(listOf("https://example.com/good.png", "https://example.com/backup.png"),
+            config.files.single().resolveThumbnailUrls(config.thumbnails))
+        assertEquals(null, config.thumbnails["file_01"])
+        assertEquals(null, config.thumbnails["bad"])
+        assertEquals(null, config.thumbnails["empty"])
+        assertEquals(listOf("https://example.com/good.png"), config.files.single().resolveThumbnailUrls(
+            mapOf("file_01" to "https://example.com/good.png", "files.zip" to "https://example.com/good.png")
+        ))
+    }
+
+    @Test
     @GraphicsMode(GraphicsMode.Mode.NATIVE)
     fun `thumbnail loader decodes redirected images and reports missing assets`() = runBlocking {
         val context = ApplicationProvider.getApplicationContext<Context>()
@@ -254,6 +296,96 @@ class DropZoneRobolectricTest {
             assertTrue(load("missing") is ErrorResult)
         } finally {
             loader.shutdown()
+            server.stop(0)
+        }
+    }
+
+    @Test
+    fun `banner gets a visible loading area and retries after failure`() {
+        val controller = Robolectric.buildActivity(ComponentActivity::class.java).setup()
+        val activity = controller.get()
+        var failedCallback: (() -> Unit)? = null
+        var created = 0
+        var released = 0
+        var show by mutableStateOf(true)
+        try {
+            composeRule.setContent {
+                if (show) BannerSlot(
+                    activity = activity,
+                    createBanner = { host, onFailure ->
+                        assertEquals(activity, host)
+                        created++
+                        failedCallback = onFailure
+                        View(host)
+                    },
+                    releaseBanner = { released++ }
+                )
+            }
+            composeRule.mainClock.advanceTimeByFrame()
+            composeRule.waitForIdle()
+            val bounds = composeRule.onNodeWithTag("unity_banner").getUnclippedBoundsInRoot()
+            assertEquals(320f, (bounds.right - bounds.left).value, 0.1f)
+            assertEquals(50f, (bounds.bottom - bounds.top).value, 0.1f)
+            assertEquals(1, created)
+
+            composeRule.runOnIdle { checkNotNull(failedCallback).invoke() }
+            composeRule.mainClock.advanceTimeBy(200L)
+            composeRule.waitForIdle()
+            composeRule.onNodeWithTag("unity_banner").assertDoesNotExist()
+            assertEquals(1, released)
+            composeRule.mainClock.advanceTimeBy(30_100L)
+            composeRule.waitForIdle()
+            assertEquals(2, created)
+            composeRule.onNodeWithTag("unity_banner").assertIsDisplayed()
+            composeRule.runOnIdle { show = false }
+            composeRule.mainClock.advanceTimeBy(200L)
+            composeRule.waitForIdle()
+            assertEquals(2, released)
+        } finally {
+            composeRule.mainClock.autoAdvance = true
+            controller.pause().stop().destroy()
+        }
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    fun `thumbnail card loads a working fallback after the first image fails`() {
+        val png = Base64.getDecoder().decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+        )
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val hits = AtomicInteger()
+        server.createContext("/missing") { exchange ->
+            exchange.sendResponseHeaders(404, -1)
+            exchange.close()
+        }
+        server.createContext("/image") { exchange ->
+            hits.incrementAndGet()
+            exchange.responseHeaders.add("Content-Type", "image/png")
+            exchange.sendResponseHeaders(200, png.size.toLong())
+            exchange.responseBody.use { it.write(png) }
+        }
+        server.start()
+        try {
+            val item = LibraryFileItem(
+                id = "image_test", title = "Pack", sizeLabel = "1 MB",
+                downloadUrl = "https://example.com/files.zip", targetSubPath = "", fileName = "files.zip"
+            )
+            val urls = listOf(
+                "http://127.0.0.1:${server.address.port}/missing",
+                "http://127.0.0.1:${server.address.port}/image"
+            )
+            composeRule.setContent {
+                DropZoneTheme {
+                    LibraryFileCard(item, urls, "Target", null, false, false, {})
+                }
+            }
+            composeRule.waitUntil(10_000L) {
+                composeRule.onAllNodesWithTag("thumbnail_loaded_image_test").fetchSemanticsNodes().isNotEmpty()
+            }
+            composeRule.onNodeWithTag("thumbnail_loaded_image_test").assertIsDisplayed()
+            assertTrue(hits.get() > 0)
+        } finally {
             server.stop(0)
         }
     }
@@ -594,7 +726,8 @@ class DropZoneRobolectricTest {
                     resolveTargetPreview = { version, item, suffix ->
                         "/storage/emulated/0/Android/data/${version.packageName}/ ($suffix)"
                     },
-                    snackbarEvents = emptyFlow<SnackbarEvent>()
+                    snackbarEvents = emptyFlow<SnackbarEvent>(),
+                    banner = { Box(Modifier.fillMaxWidth().height(50.dp).testTag("test_banner")) }
                 )
             }
         }
@@ -611,6 +744,9 @@ class DropZoneRobolectricTest {
             .performScrollTo()
             .assertIsDisplayed()
         composeRule.onNodeWithText(EnAppStrings.actionDownloadAndApply).assertIsDisplayed()
+        val buttonBounds = composeRule.onNodeWithTag("download_apply_button_custom_01").getUnclippedBoundsInRoot()
+        val bannerBounds = composeRule.onNodeWithTag("test_banner").getUnclippedBoundsInRoot()
+        assertTrue(buttonBounds.bottom <= bannerBounds.top)
 
         // Toggle to MM
         composeRule.onNodeWithTag("language_toggle_mm").performClick()
