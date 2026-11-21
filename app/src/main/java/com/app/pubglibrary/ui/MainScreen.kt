@@ -38,6 +38,7 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
@@ -54,10 +55,13 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.filled.Launch
 import androidx.compose.material.icons.filled.Build
@@ -69,6 +73,7 @@ import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.FolderCopy
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Refresh
@@ -137,11 +142,15 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import coil.compose.AsyncImage
+import coil.compose.AsyncImagePainter
 import com.app.pubglibrary.R
 import com.app.pubglibrary.data.AppLanguage
 import com.app.pubglibrary.data.InstalledPackageInfo
 import com.app.pubglibrary.data.LibraryFileItem
 import com.app.pubglibrary.data.PubgVersion
+import com.app.pubglibrary.data.RemoteNotice
+import com.app.pubglibrary.data.resolveThumbnailUrl
 import com.app.pubglibrary.shizuku.ShizukuStatus
 import com.app.pubglibrary.ui.i18n.LocalAppStrings
 import com.app.pubglibrary.ui.i18n.NOTICE_CREDIT_MESSAGE
@@ -178,6 +187,7 @@ fun MainScreen(
         onToggleNoticeDontShowAgain = { viewModel.setNoticeDontShowAgain(it) },
         onDismissNotice = { viewModel.dismissNoticeDialog() },
         onOpenNotice = { viewModel.openNoticeDialog() },
+        onDismissRemoteNotice = viewModel::dismissRemoteNotice,
         onRegisterShizuku = { viewModel.registerShizukuListeners() },
         onUnregisterShizuku = { viewModel.unregisterShizukuListeners() },
         onRefreshEnvironment = { viewModel.refreshEnvironmentState() },
@@ -221,7 +231,8 @@ internal fun MainScreenContent(
     modifier: Modifier = Modifier,
     onToggleNoticeDontShowAgain: (Boolean) -> Unit = {},
     onDismissNotice: () -> Unit = {},
-    onOpenNotice: () -> Unit = {}
+    onOpenNotice: () -> Unit = {},
+    onDismissRemoteNotice: (String) -> Unit = {}
 ) {
     val appStrings = remember(uiState.language) { stringsFor(uiState.language) }
     val latestStrings by rememberUpdatedState(appStrings)
@@ -361,6 +372,17 @@ internal fun MainScreenContent(
                             onOpenShizukuClick = onOpenShizukuApp
                         )
 
+                        uiState.remoteNotice?.let { notice ->
+                            RemoteNoticeBanner(
+                                notice = notice,
+                                onDismiss = { onDismissRemoteNotice(notice.id) },
+                                modifier = Modifier
+                                    .align(Alignment.CenterHorizontally)
+                                    .widthIn(max = 860.dp)
+                                    .padding(horizontal = 16.dp, vertical = 4.dp)
+                            )
+                        }
+
                         Box(
                             modifier = Modifier.fillMaxSize(),
                             contentAlignment = Alignment.TopCenter
@@ -413,6 +435,7 @@ internal fun MainScreenContent(
                                         maintenanceMessage = uiState.maintenanceMessage,
                                         announcement = uiState.announcement,
                                         items = uiState.visibleItems,
+                                        thumbnails = uiState.thumbnails,
                                         availableCategories = uiState.availableCategories,
                                         selectedCategory = uiState.selectedCategory,
                                         searchQuery = uiState.searchQuery,
@@ -1222,6 +1245,7 @@ private fun FileLibraryScreen(
     maintenanceMessage: String,
     announcement: String,
     items: List<LibraryFileItem>,
+    thumbnails: Map<String, String>,
     availableCategories: List<String>,
     selectedCategory: String,
     searchQuery: String,
@@ -1555,6 +1579,9 @@ private fun FileLibraryScreen(
                     ) { item ->
                         LibraryFileCard(
                             item = item,
+                            thumbnailUrl = remember(item, thumbnails) {
+                                item.resolveThumbnailUrl(thumbnails)
+                            },
                             targetPathPreview = resolveTargetPreview(item),
                             transferState = transferStates[item.id],
                             wasApplied = item.id in appliedItemIds,
@@ -1567,6 +1594,56 @@ private fun FileLibraryScreen(
                             )
                         )
                     }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RemoteNoticeBanner(
+    notice: RemoteNotice,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val strings = LocalAppStrings.current
+    val (icon, accent, background) = when (notice.type.trim().lowercase()) {
+        "warning" -> Triple(Icons.Filled.WarningAmber, AmberText, AmberContainer)
+        "update" -> Triple(Icons.Filled.Download, EmeraldText, EmeraldContainer)
+        else -> Triple(Icons.Filled.Info, TextPrimary, SlateElevated)
+    }
+
+    Surface(
+        modifier = modifier.fillMaxWidth().testTag("remote_notice_banner"),
+        color = background,
+        shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(1.dp, accent.copy(alpha = 0.45f))
+    ) {
+        Row(
+            modifier = Modifier.padding(start = 12.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Icon(icon, contentDescription = null, tint = accent)
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .heightIn(max = 120.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Text(
+                    text = notice.title.ifBlank { strings.announcementTitle },
+                    style = MaterialTheme.typography.titleSmall,
+                    color = accent
+                )
+                if (notice.message.isNotBlank()) {
+                    Text(notice.message, style = MaterialTheme.typography.bodySmall, color = TextPrimary)
+                }
+            }
+            if (notice.canDismiss) {
+                IconButton(onClick = onDismiss, modifier = Modifier.testTag("dismiss_remote_notice")) {
+                    Icon(Icons.Filled.Close, contentDescription = strings.noticeCloseButton, tint = accent)
                 }
             }
         }
@@ -1738,6 +1815,7 @@ private fun RemoteErrorState(
 @Composable
 private fun LibraryFileCard(
     item: LibraryFileItem,
+    thumbnailUrl: String?,
     targetPathPreview: String,
     transferState: ItemTransferState?,
     wasApplied: Boolean,
@@ -1856,20 +1934,34 @@ private fun LibraryFileCard(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
+                val thumbnailShape = RoundedCornerShape(8.dp)
+                val fallbackIcon = if (isZip) Icons.Filled.FolderCopy else Icons.AutoMirrored.Filled.InsertDriveFile
                 Box(
                     modifier = Modifier
-                        .size(28.dp)
-                        .clip(RoundedCornerShape(8.dp))
+                        .size(36.dp)
+                        .clip(thumbnailShape)
                         .background(AmberContainer)
-                        .border(1.dp, AmberSignal.copy(alpha = 0.4f), RoundedCornerShape(8.dp)),
+                        .border(1.dp, AmberSignal.copy(alpha = 0.4f), thumbnailShape),
                     contentAlignment = Alignment.Center
                 ) {
-                    Icon(
-                        imageVector = Icons.Filled.SportsEsports,
-                        contentDescription = null,
-                        tint = AmberSignal,
-                        modifier = Modifier.size(16.dp)
-                    )
+                    var thumbnailLoaded by remember(thumbnailUrl) { mutableStateOf(false) }
+                    if (!thumbnailLoaded) {
+                        Icon(
+                            imageVector = fallbackIcon,
+                            contentDescription = null,
+                            tint = AmberSignal,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                    if (thumbnailUrl != null) {
+                        AsyncImage(
+                            model = thumbnailUrl,
+                            contentDescription = null,
+                            modifier = Modifier.fillMaxSize(),
+                            onState = { thumbnailLoaded = it is AsyncImagePainter.State.Success },
+                            contentScale = ContentScale.Crop
+                        )
+                    }
                 }
                 Text(
                     text = item.title,
