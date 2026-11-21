@@ -15,6 +15,10 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.test.core.app.ApplicationProvider
+import coil.ImageLoader
+import coil.request.ErrorResult
+import coil.request.ImageRequest
+import coil.request.SuccessResult
 import com.app.pubglibrary.data.AppLanguage
 import com.app.pubglibrary.data.DownloadStage
 import com.app.pubglibrary.data.FileRepository
@@ -23,6 +27,8 @@ import com.app.pubglibrary.data.LibraryFileItem
 import com.app.pubglibrary.data.NetworkReachabilityChecker
 import com.app.pubglibrary.data.PubgVersion
 import com.app.pubglibrary.data.REMOTE_CONTROL_URL
+import com.app.pubglibrary.data.RemoteNotice
+import com.app.pubglibrary.data.resolveThumbnailUrl
 import com.app.pubglibrary.service.FileUserService
 import com.app.pubglibrary.shizuku.DownloadFileSource
 import com.app.pubglibrary.shizuku.ShizukuStatus
@@ -36,6 +42,7 @@ import com.app.pubglibrary.ui.i18n.MmAppStrings
 import com.app.pubglibrary.ui.parseStructuredDescription
 import com.app.pubglibrary.ui.theme.DropZoneTheme
 import com.sun.net.httpserver.HttpServer
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emptyFlow
@@ -54,10 +61,12 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows
 import org.robolectric.annotation.Config
+import org.robolectric.annotation.GraphicsMode
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.net.InetSocketAddress
+import java.util.Base64
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.ZipEntry
@@ -134,6 +143,117 @@ class DropZoneRobolectricTest {
         assertEquals("General", parsed.files[0].category)
         assertEquals("", parsed.files[1].description)
         assertFalse(parsed.files[1].enabled)
+    }
+
+    @Test
+    fun `remote config supports optional notices and resolves thumbnails by id then filename then title`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val repo = FileRepository(context)
+        val config = requireNotNull(repo.parseRemoteConfigJson(
+            """
+            {
+              "notice": {
+                "enabled": true, "id": "release-2", "type": "update",
+                "title": "New release", "message": "The archive is ready.", "dismissible": true
+              },
+              "thumbnails": {
+                "file_01": "https://github.com/example/project/releases/download/v2/preview.png",
+                "files.zip": "https://example.com/file.png",
+                "Sample Pack": "https://example.com/title.png"
+              },
+              "files": [{
+                "id": "file_01", "title": "Sample Pack", "sizeLabel": "1 MB",
+                "downloadUrl": "https://example.com/files.zip",
+                "targetSubPath": "", "fileName": "files.zip"
+              }]
+            }
+            """
+        ))
+        assertEquals(
+            RemoteNotice(true, "release-2", "update", "New release", "The archive is ready.", true),
+            config.notice
+        )
+        val item = config.files.single()
+        assertEquals(config.thumbnails.getValue(item.id), item.resolveThumbnailUrl(config.thumbnails))
+        assertEquals("https://example.com/file.png", item.resolveThumbnailUrl(config.thumbnails - item.id))
+        assertEquals(
+            "https://example.com/title.png",
+            item.resolveThumbnailUrl(mapOf(item.fileName to "file:///preview.png", item.title to "https://example.com/title.png"))
+        )
+        assertEquals(null, item.resolveThumbnailUrl(emptyMap()))
+
+        val legacyConfig = requireNotNull(repo.parseRemoteConfigJson("""{"announcement":"Legacy"}"""))
+        assertEquals("Legacy", legacyConfig.announcement)
+        assertEquals(null, legacyConfig.notice)
+        assertTrue(legacyConfig.thumbnails.isEmpty())
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    fun `thumbnail loader decodes redirected images and reports missing assets`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val loader = ImageLoader.Builder(context).build()
+        val png = Base64.getDecoder().decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+        )
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.createContext("/release") { exchange ->
+            exchange.responseHeaders.add("Location", "/asset")
+            exchange.sendResponseHeaders(302, -1)
+            exchange.close()
+        }
+        server.createContext("/asset") { exchange ->
+            exchange.responseHeaders.add("Content-Type", "image/png")
+            exchange.sendResponseHeaders(200, png.size.toLong())
+            exchange.responseBody.use { it.write(png) }
+        }
+        server.createContext("/missing") { exchange ->
+            exchange.sendResponseHeaders(404, -1)
+            exchange.close()
+        }
+        server.start()
+        try {
+            suspend fun load(path: String) = withTimeout(10_000) {
+                val result = async {
+                    loader.execute(
+                        ImageRequest.Builder(context)
+                            .data("http://127.0.0.1:${server.address.port}/$path")
+                            .size(36)
+                            .build()
+                    )
+                }
+                while (!result.isCompleted) {
+                    Shadows.shadowOf(Looper.getMainLooper()).idle()
+                    delay(10)
+                }
+                result.await()
+            }
+            val redirected = load("release")
+            assertTrue((redirected as? ErrorResult)?.throwable?.toString(), redirected is SuccessResult)
+            assertTrue(load("missing") is ErrorResult)
+        } finally {
+            loader.shutdown()
+            server.stop(0)
+        }
+    }
+
+    @Test
+    fun `remote notice dismissals persist by id separately from startup notice preferences`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val preferences = LanguagePreferences(context)
+        preferences.dismissRemoteNotice("first-notice")
+        preferences.dismissRemoteNotice("second-notice")
+
+        val saved = LanguagePreferences(context).preferencesFlow.first()
+        assertTrue(saved.dismissedRemoteNoticeIds.containsAll(listOf("first-notice", "second-notice")))
+        val notice = RemoteNotice(enabled = true, id = "first-notice", dismissible = true)
+        assertFalse(notice.isVisible(false, saved.dismissedRemoteNoticeIds))
+        val newNotice = notice.copy(id = "new-notice")
+        assertTrue(newNotice.isVisible(false, saved.dismissedRemoteNoticeIds))
+        assertFalse(newNotice.isVisible(true, saved.dismissedRemoteNoticeIds))
+        assertFalse(newNotice.copy(enabled = false).isVisible(false, saved.dismissedRemoteNoticeIds))
+        assertTrue(notice.copy(dismissible = false).isVisible(false, saved.dismissedRemoteNoticeIds))
+        assertFalse(saved.dontShowNoticeAgain)
     }
 
     @Test

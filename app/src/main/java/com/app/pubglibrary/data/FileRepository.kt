@@ -9,6 +9,7 @@ import com.app.pubglibrary.ui.i18n.UiText
 import com.squareup.moshi.JsonClass
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -101,12 +102,39 @@ data class LibraryFileItem(
     }
 }
 
+@Immutable
+@JsonClass(generateAdapter = true)
+data class RemoteNotice(
+    val enabled: Boolean = false,
+    val id: String = "",
+    val type: String = "info",
+    val title: String = "",
+    val message: String = "",
+    val dismissible: Boolean = false
+) {
+    val canDismiss: Boolean get() = dismissible && id.isNotBlank()
+
+    internal fun isVisible(maintenance: Boolean, dismissedIds: Set<String>): Boolean =
+        enabled && !maintenance && (!canDismiss || id !in dismissedIds)
+}
+
+internal fun LibraryFileItem.resolveThumbnailUrl(thumbnails: Map<String, String>): String? {
+    if (thumbnails.isEmpty()) return null
+    for (key in listOf(id, fileName, title)) {
+        val url = thumbnails[key]?.trim()?.toHttpUrlOrNull()
+        if (url != null) return url.toString()
+    }
+    return null
+}
+
 @JsonClass(generateAdapter = true)
 data class RemoteControlConfig(
     val maintenance: Boolean = false,
     val maintenanceMessage: String = "",
     val announcement: String = "",
-    val files: List<LibraryFileItem> = emptyList()
+    val files: List<LibraryFileItem> = emptyList(),
+    val notice: RemoteNotice? = null,
+    val thumbnails: Map<String, String> = emptyMap()
 )
 
 sealed interface RemoteCatalogResult {
@@ -224,7 +252,9 @@ class FileRepository(private val context: Context) {
                     isSampleMode = false
                 )
             }
-        } catch (t: Throwable) {
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (t: Exception) {
             val detail = t.message?.takeIf { it.isNotBlank() }
             RemoteCatalogResult.Error(
                 if (t is java.io.IOException || detail == null) {

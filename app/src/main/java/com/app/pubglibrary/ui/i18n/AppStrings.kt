@@ -89,6 +89,7 @@ data class AppStrings(
     // Notice Popup Dialog
     val noticeDontShowAgain: String,
     val noticeCloseButton: String,
+    val errSaveNoticeDismissal: String,
 
     // Overwrite Dialog
     val overwriteDialogTitle: String,
@@ -214,6 +215,7 @@ val EnAppStrings = AppStrings(
 
     noticeDontShowAgain = "Don't show again",
     noticeCloseButton = "Close",
+    errSaveNoticeDismissal = "Could not dismiss the notice. Please try again.",
 
     overwriteDialogTitle = "File Already Exists",
     overwriteDialogMessageSingle = "A file already exists at the target location. Overwrite it with the downloaded file?",
@@ -331,6 +333,7 @@ val MmAppStrings = AppStrings(
 
     noticeDontShowAgain = "နောက်ထပ် မပြတော့ပါ",
     noticeCloseButton = "ပိတ်မည်",
+    errSaveNoticeDismissal = "အသိပေးချက်ကို ပိတ်၍မရပါ။ ထပ်စမ်းကြည့်ပါ။",
 
     overwriteDialogTitle = "ဖိုင် ရှိနှင့်ပြီးဖြစ်နေပါသည်",
     overwriteDialogMessageSingle = "သတ်မှတ်ထားသော လမ်းကြောင်းတွင် ဖိုင်ရှိနှင့်ပြီးဖြစ်ပါသည်။ ဒေါင်းလုဒ်ဆွဲထားသော ဖိုင်ဖြင့် အစားထိုးမည်လား?",

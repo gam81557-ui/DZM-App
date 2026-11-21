@@ -15,6 +15,7 @@ import com.app.pubglibrary.data.LibraryFileItem
 import com.app.pubglibrary.data.NetworkReachabilityChecker
 import com.app.pubglibrary.data.PubgVersion
 import com.app.pubglibrary.data.RemoteCatalogResult
+import com.app.pubglibrary.data.RemoteNotice
 import com.app.pubglibrary.shizuku.ShizukuHelper
 import com.app.pubglibrary.shizuku.ShizukuLocalizedException
 import com.app.pubglibrary.shizuku.ShizukuStatus
@@ -32,6 +33,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import java.io.IOException
 
 @Immutable
 sealed interface ItemTransferState {
@@ -71,6 +73,8 @@ data class DropZoneUiState(
     val maintenance: Boolean = false,
     val maintenanceMessage: String = "",
     val announcement: String = "",
+    val remoteNotice: RemoteNotice? = null,
+    val thumbnails: Map<String, String> = emptyMap(),
     val allCatalogItems: List<LibraryFileItem> = emptyList(),
     val visibleItems: List<LibraryFileItem> = emptyList(),
     val availableCategories: List<String> = listOf("All"),
@@ -111,7 +115,6 @@ class DropZoneViewModel(
     private val _forceOpenNotice = MutableStateFlow(false)
     private val _installedVersions = MutableStateFlow(repository.detectInstalledVersions())
     private val _selectedVersion = MutableStateFlow<PubgVersion?>(null)
-    private val _allCatalogItems = MutableStateFlow<List<LibraryFileItem>>(emptyList())
     private val _selectedCategory = MutableStateFlow("All")
     private val _searchQuery = MutableStateFlow("")
     private val _transferStates = MutableStateFlow<Map<String, ItemTransferState>>(emptyMap())
@@ -125,6 +128,9 @@ class DropZoneViewModel(
         val maintenance: Boolean = false,
         val maintenanceMessage: String = "",
         val announcement: String = "",
+        val notice: RemoteNotice? = null,
+        val thumbnails: Map<String, String> = emptyMap(),
+        val items: List<LibraryFileItem> = emptyList(),
         val refreshing: Boolean = false,
         val isSampleMode: Boolean = false,
         val hasLoadedOnce: Boolean = false,
@@ -134,6 +140,7 @@ class DropZoneViewModel(
     private data class UiPrefsSnapshot(
         val language: AppLanguage = AppLanguage.EN,
         val dontShowNoticeAgain: Boolean = false,
+        val dismissedRemoteNoticeIds: Set<String> = emptySet(),
         val showNoticeDialog: Boolean = false,
         val isNetworkVerified: Boolean = false
     )
@@ -166,6 +173,7 @@ class DropZoneViewModel(
         UiPrefsSnapshot(
             language = effectiveLang,
             dontShowNoticeAgain = effectiveDontShow,
+            dismissedRemoteNoticeIds = saved.dismissedRemoteNoticeIds,
             showNoticeDialog = showNotice,
             isNetworkVerified = networkVerified
         )
@@ -176,7 +184,6 @@ class DropZoneViewModel(
         shizukuHelper.status,
         _installedVersions,
         _selectedVersion,
-        _allCatalogItems,
         _selectedCategory,
         _searchQuery,
         _remoteMeta,
@@ -189,16 +196,15 @@ class DropZoneViewModel(
         @Suppress("UNCHECKED_CAST")
         val installed = values[2] as Map<PubgVersion, InstalledPackageInfo>
         val selectedVersion = values[3] as PubgVersion?
+        val selectedCategory = values[4] as String
+        val query = values[5] as String
+        val meta = values[6] as RemoteMeta
+        val allItems = meta.items
         @Suppress("UNCHECKED_CAST")
-        val allItems = values[4] as List<LibraryFileItem>
-        val selectedCategory = values[5] as String
-        val query = values[6] as String
-        val meta = values[7] as RemoteMeta
+        val transfers = values[7] as Map<String, ItemTransferState>
         @Suppress("UNCHECKED_CAST")
-        val transfers = values[8] as Map<String, ItemTransferState>
-        @Suppress("UNCHECKED_CAST")
-        val appliedIds = values[9] as Set<String>
-        val overwrite = values[10] as OverwritePrompt?
+        val appliedIds = values[8] as Set<String>
+        val overwrite = values[9] as OverwritePrompt?
 
         // Strictly keep only enabled == true items matching the active PUBG version (or "all"/empty)
         val versionItems = if (selectedVersion == null) {
@@ -238,6 +244,10 @@ class DropZoneViewModel(
             maintenance = meta.maintenance,
             maintenanceMessage = meta.maintenanceMessage,
             announcement = meta.announcement,
+            remoteNotice = meta.notice?.takeIf {
+                it.isVisible(meta.maintenance, prefs.dismissedRemoteNoticeIds)
+            },
+            thumbnails = meta.thumbnails,
             allCatalogItems = allItems,
             visibleItems = filtered,
             availableCategories = categories,
@@ -335,6 +345,19 @@ class DropZoneViewModel(
         _forceOpenNotice.value = false
     }
 
+    fun dismissRemoteNotice(id: String) {
+        val meta = _remoteMeta.value
+        val notice = meta.notice ?: return
+        if (meta.maintenance || !notice.enabled || !notice.canDismiss || notice.id != id) return
+        viewModelScope.launch {
+            try {
+                languagePreferences.dismissRemoteNotice(id)
+            } catch (_: IOException) {
+                emitSnackbar(UiText.Localized { it.errSaveNoticeDismissal }, SnackbarKind.ERROR)
+            }
+        }
+    }
+
     fun openNoticeDialog() {
         _forceOpenNotice.value = true
     }
@@ -401,11 +424,13 @@ class DropZoneViewModel(
             when (val result = repository.loadRemoteControlConfig()) {
                 is RemoteCatalogResult.Success -> {
                     val config = result.config
-                    _allCatalogItems.value = config.files
                     _remoteMeta.value = RemoteMeta(
                         maintenance = config.maintenance,
                         maintenanceMessage = config.maintenanceMessage.trim(),
                         announcement = config.announcement.trim(),
+                        notice = config.notice,
+                        thumbnails = config.thumbnails,
+                        items = config.files,
                         refreshing = false,
                         isSampleMode = result.isSampleMode,
                         hasLoadedOnce = true,
@@ -442,7 +467,6 @@ class DropZoneViewModel(
                 }
                 is RemoteCatalogResult.Error -> {
                     // Strictly rely on remote JSON when configured; never fall back to stale sample items
-                    _allCatalogItems.value = emptyList()
                     _remoteMeta.value = RemoteMeta(
                         maintenance = false,
                         maintenanceMessage = "",

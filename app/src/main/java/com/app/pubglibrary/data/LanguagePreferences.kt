@@ -7,6 +7,7 @@ import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStoreFile
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import kotlinx.coroutines.flow.Flow
@@ -28,7 +29,8 @@ enum class AppLanguage(val code: String) {
 
 data class AppPreferencesState(
     val language: AppLanguage = AppLanguage.EN,
-    val dontShowNoticeAgain: Boolean = false
+    val dontShowNoticeAgain: Boolean = false,
+    val dismissedRemoteNoticeIds: Set<String> = emptySet()
 )
 
 private object LanguageDataStoreRegistry {
@@ -60,7 +62,8 @@ class LanguagePreferences(context: Context) {
         .map { prefs ->
             AppPreferencesState(
                 language = AppLanguage.fromCode(prefs[KEY_APP_LANGUAGE]),
-                dontShowNoticeAgain = prefs[KEY_DONT_SHOW_NOTICE_AGAIN] ?: false
+                dontShowNoticeAgain = prefs[KEY_DONT_SHOW_NOTICE_AGAIN] ?: false,
+                dismissedRemoteNoticeIds = prefs[KEY_DISMISSED_REMOTE_NOTICE_IDS].orEmpty()
             )
         }
 
@@ -80,7 +83,14 @@ class LanguagePreferences(context: Context) {
         }
     }
 
+    suspend fun dismissRemoteNotice(id: String) {
+        dataStore.edit { prefs ->
+            prefs[KEY_DISMISSED_REMOTE_NOTICE_IDS] = prefs[KEY_DISMISSED_REMOTE_NOTICE_IDS].orEmpty() + id
+        }
+    }
+
     private companion object {
+        val KEY_DISMISSED_REMOTE_NOTICE_IDS = stringSetPreferencesKey("dismissed_remote_notice_ids")
         val KEY_APP_LANGUAGE = stringPreferencesKey("app_language")
         val KEY_DONT_SHOW_NOTICE_AGAIN = booleanPreferencesKey("dont_show_notice_again")
     }
