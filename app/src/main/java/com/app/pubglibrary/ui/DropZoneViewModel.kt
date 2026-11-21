@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.compose.runtime.Immutable
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.app.pubglibrary.ads.RewardedAdResult
 import com.app.pubglibrary.data.AppLanguage
 import com.app.pubglibrary.data.AppPreferencesState
 import com.app.pubglibrary.data.DefaultNetworkReachabilityChecker
@@ -38,6 +39,7 @@ import java.io.IOException
 @Immutable
 sealed interface ItemTransferState {
     data class Downloading(val progress: Float) : ItemTransferState
+    data object WaitingForAd : ItemTransferState
     data object WaitingForPermission : ItemTransferState
     data object CheckingTarget : ItemTransferState
     data object Applying : ItemTransferState
@@ -95,7 +97,8 @@ data class DropZoneUiState(
 class DropZoneViewModel(
     application: Application,
     private val networkChecker: NetworkReachabilityChecker,
-    private val retryIntervalMs: Long = 1_500L
+    private val retryIntervalMs: Long = 1_500L,
+    catalogLoader: (suspend () -> RemoteCatalogResult)? = null
 ) : AndroidViewModel(application) {
 
     constructor(application: Application) : this(
@@ -105,6 +108,7 @@ class DropZoneViewModel(
 
     private val shizukuHelper = ShizukuHelper(application)
     private val repository = FileRepository(application)
+    private val loadCatalog = catalogLoader ?: repository::loadRemoteControlConfig
     private val languagePreferences = LanguagePreferences(application)
 
     private val _isNetworkVerified = MutableStateFlow(false)
@@ -130,6 +134,7 @@ class DropZoneViewModel(
         val announcement: String = "",
         val notice: RemoteNotice? = null,
         val thumbnails: Map<String, String> = emptyMap(),
+        val requireAdForDownload: Boolean = false,
         val items: List<LibraryFileItem> = emptyList(),
         val refreshing: Boolean = false,
         val isSampleMode: Boolean = false,
@@ -421,7 +426,7 @@ class DropZoneViewModel(
         if (_remoteMeta.value.refreshing) return
         viewModelScope.launch {
             _remoteMeta.update { it.copy(refreshing = true) }
-            when (val result = repository.loadRemoteControlConfig()) {
+            when (val result = loadCatalog()) {
                 is RemoteCatalogResult.Success -> {
                     val config = result.config
                     _remoteMeta.value = RemoteMeta(
@@ -430,6 +435,7 @@ class DropZoneViewModel(
                         announcement = config.announcement.trim(),
                         notice = config.notice,
                         thumbnails = config.thumbnails,
+                        requireAdForDownload = config.requireAdForDownload,
                         items = config.files,
                         refreshing = false,
                         isSampleMode = result.isSampleMode,
@@ -498,7 +504,10 @@ class DropZoneViewModel(
         )
     }
 
-    fun downloadAndApply(item: LibraryFileItem) {
+    fun downloadAndApply(
+        item: LibraryFileItem,
+        showRewardedAd: suspend () -> RewardedAdResult
+    ) {
         val meta = _remoteMeta.value
         if (meta.maintenance) {
             val message = if (meta.maintenanceMessage.isNotBlank()) {
@@ -520,9 +529,34 @@ class DropZoneViewModel(
         val version = _selectedVersion.value ?: return
         if (_transferStates.value.containsKey(item.id)) return
 
-        _transferStates.update { it + (item.id to ItemTransferState.WaitingForPermission) }
+        if (item !in meta.items || !item.matchesVersion(version)) return
+        if (meta.requireAdForDownload) {
+            if (ItemTransferState.WaitingForAd in _transferStates.value.values) return
+            _transferStates.update { it + (item.id to ItemTransferState.WaitingForAd) }
+        } else {
+            _transferStates.update { it + (item.id to ItemTransferState.WaitingForPermission) }
+        }
+
         viewModelScope.launch {
             try {
+                if (meta.requireAdForDownload) {
+                    when (showRewardedAd()) {
+                        RewardedAdResult.COMPLETED -> Unit
+                        RewardedAdResult.SKIPPED -> {
+                            emitSnackbar(UiText.Localized { it.msgRewardedAdSkipped }, SnackbarKind.INFO)
+                            return@launch
+                        }
+                        RewardedAdResult.UNAVAILABLE -> {
+                            emitSnackbar(UiText.Localized { it.msgRewardedAdUnavailable }, SnackbarKind.ERROR)
+                            return@launch
+                        }
+                    }
+                    val current = _remoteMeta.value
+                    if (current.maintenance || _selectedVersion.value != version || item !in current.items) {
+                        return@launch
+                    }
+                    _transferStates.update { it + (item.id to ItemTransferState.WaitingForPermission) }
+                }
                 processDownloadAndApply(item, version)
             } catch (err: ShizukuLocalizedException) {
                 emitSnackbar(err.uiText, SnackbarKind.ERROR)
