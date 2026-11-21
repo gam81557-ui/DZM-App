@@ -12,6 +12,7 @@ import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
@@ -22,6 +23,8 @@ import okhttp3.Request
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.TimeUnit
+import java.util.zip.ZipException
+import java.util.zip.ZipFile
 
 /**
  * Single configurable remote control JSON URL.
@@ -252,108 +255,110 @@ class FileRepository(private val context: Context) {
 
     fun downloadFile(item: LibraryFileItem): Flow<DownloadStage> = flow {
         val safeVersionFolder = item.versionKey.trim().ifEmpty { "all" }.lowercase()
+        emit(DownloadStage.Downloading(0f))
         val stagingDir = File(context.filesDir, "downloads/$safeVersionFolder")
-        if (!stagingDir.exists() && !stagingDir.mkdirs()) {
+        if (!stagingDir.isDirectory && !stagingDir.mkdirs() && !stagingDir.isDirectory) {
             emit(DownloadStage.Failed(UiText.Localized { it.errCreateStagingDir }))
             return@flow
         }
 
         val finalFile = File(stagingDir, item.fileName)
-        val tempFile = File(stagingDir, "${item.fileName}.part")
-
-        // Ensure stale cached or partial files with the same name are replaced cleanly
-        if (tempFile.exists()) {
-            tempFile.delete()
-        }
-
-        if (item.downloadUrl.startsWith("sample://") && isSampleModeConfigured()) {
-            emit(DownloadStage.Downloading(0.08f))
-            val sampleBytes = buildSamplePayload(item).toByteArray(Charsets.UTF_8)
-            val steps = 8
-            for (step in 1..steps) {
-                delay(75L)
-                emit(DownloadStage.Downloading(step / steps.toFloat()))
-            }
-            FileOutputStream(tempFile, false).use { out ->
-                out.write(sampleBytes)
-                out.flush()
-            }
-            if (finalFile.exists()) finalFile.delete()
-            if (!tempFile.renameTo(finalFile)) {
-                tempFile.copyTo(finalFile, overwrite = true)
-                tempFile.delete()
-            }
-            emit(DownloadStage.Completed(finalFile))
-            return@flow
-        }
-
+        val tempFile = File.createTempFile("download-", ".part", stagingDir)
         try {
-            emit(DownloadStage.Downloading(0f))
-            val request = Request.Builder()
-                .url(item.downloadUrl.trim())
-                .cacheControl(CacheControl.FORCE_NETWORK)
-                .header("Cache-Control", "no-cache, no-store, must-revalidate")
-                .header("Pragma", "no-cache")
-                .get()
-                .build()
-
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) {
-                    val code = response.code
-                    emit(DownloadStage.Failed(UiText.Localized { it.errDownloadHttpFormat(code) }))
-                    return@flow
+            if (item.downloadUrl.startsWith("sample://") && isSampleModeConfigured()) {
+                val steps = 8
+                for (step in 1..steps) {
+                    delay(75L)
+                    emit(DownloadStage.Downloading(step / steps.toFloat()))
                 }
-                val body = response.body ?: run {
-                    emit(DownloadStage.Failed(UiText.Localized { it.errEmptyDownloadBody }))
-                    return@flow
-                }
-
-                val totalBytes = body.contentLength()
-                var downloadedBytes = 0L
-
-                body.byteStream().use { input ->
-                    FileOutputStream(tempFile, false).use { output ->
-                        val buffer = ByteArray(16 * 1024)
-                        while (true) {
-                            val read = input.read(buffer)
-                            if (read <= 0) break
-                            output.write(buffer, 0, read)
-                            downloadedBytes += read
-                            if (totalBytes > 0L) {
-                                val progress = (downloadedBytes.toFloat() / totalBytes.toFloat())
-                                    .coerceIn(0f, 1f)
-                                emit(DownloadStage.Downloading(progress))
-                            } else {
-                                emit(DownloadStage.Downloading(-1f))
-                            }
-                        }
-                        output.flush()
-                    }
-                }
+                tempFile.writeText(buildSamplePayload(item))
+            } else if (!downloadToTempFile(item, tempFile) { emit(it) }) {
+                return@flow
             }
 
-            if (finalFile.exists() && !finalFile.delete()) {
-                tempFile.copyTo(finalFile, overwrite = true)
-                tempFile.delete()
-            } else if (!tempFile.renameTo(finalFile)) {
-                tempFile.copyTo(finalFile, overwrite = true)
-                tempFile.delete()
+            if (tempFile.length() == 0L) {
+                emit(DownloadStage.Failed(UiText.Localized { it.errEmptyDownloadBody }))
+                return@flow
+            }
+            if (isZipFile(item) && !isReadableZip(tempFile)) {
+                emit(DownloadStage.Failed(UiText.Localized { it.errInvalidDownloadedZip }))
+                return@flow
+            }
+            // Publish only a completed download; keep the previous file if publishing fails.
+            if (!tempFile.renameTo(finalFile) || !finalFile.isFile) {
+                emit(DownloadStage.Failed(UiText.Localized { it.errSaveDownloadedFile }))
+                return@flow
             }
             emit(DownloadStage.Completed(finalFile))
-        } catch (t: Throwable) {
+        } finally {
             tempFile.delete()
-            val detail = t.message?.takeIf { it.isNotBlank() }
-            emit(
-                DownloadStage.Failed(
-                    if (t is java.io.IOException || detail == null) {
-                        UiText.Localized { it.errNetworkDownloadingFile }
-                    } else {
-                        UiText.Raw(detail)
-                    }
-                )
-            )
         }
+    }.catch { err ->
+        val detail = err.message?.takeIf { it.isNotBlank() }
+        emit(
+            DownloadStage.Failed(
+                if (detail != null) UiText.Localized { it.errDownloadFailedFormat(detail) }
+                else UiText.Localized { it.errNetworkDownloadingFile }
+            )
+        )
     }.flowOn(Dispatchers.IO)
+
+    private fun isReadableZip(file: File): Boolean = try {
+        ZipFile(file).use { it.size() > 0 }
+    } catch (_: ZipException) {
+        false
+    }
+
+    private suspend fun downloadToTempFile(
+        item: LibraryFileItem,
+        tempFile: File,
+        emit: suspend (DownloadStage) -> Unit
+    ): Boolean {
+        val request = Request.Builder()
+            .url(item.downloadUrl.trim())
+            .cacheControl(CacheControl.FORCE_NETWORK)
+            .header("Cache-Control", "no-cache, no-store, must-revalidate")
+            .header("Pragma", "no-cache")
+            .get()
+            .build()
+
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                val code = response.code
+                emit(DownloadStage.Failed(UiText.Localized { it.errDownloadHttpFormat(code) }))
+                return false
+            }
+            val body = response.body ?: run {
+                emit(DownloadStage.Failed(UiText.Localized { it.errEmptyDownloadBody }))
+                return false
+            }
+
+            val totalBytes = body.contentLength()
+            var downloadedBytes = 0L
+
+            body.byteStream().use { input ->
+                FileOutputStream(tempFile, false).use { output ->
+                    val buffer = ByteArray(16 * 1024)
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read <= 0) break
+                        output.write(buffer, 0, read)
+                        downloadedBytes += read
+                        if (totalBytes > 0L) {
+                            val progress = (downloadedBytes.toFloat() / totalBytes.toFloat())
+                                .coerceIn(0f, 1f)
+                            emit(DownloadStage.Downloading(progress))
+                        } else {
+                            emit(DownloadStage.Downloading(-1f))
+                        }
+                    }
+                    output.flush()
+                }
+            }
+        }
+
+        return true
+    }
 
     fun isZipFile(item: LibraryFileItem): Boolean {
         return item.fileName.trim().endsWith(".zip", ignoreCase = true)
