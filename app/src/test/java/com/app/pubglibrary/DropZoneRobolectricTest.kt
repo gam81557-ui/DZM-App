@@ -19,6 +19,8 @@ import coil.ImageLoader
 import coil.request.ErrorResult
 import coil.request.ImageRequest
 import coil.request.SuccessResult
+import androidx.lifecycle.viewModelScope
+import com.app.pubglibrary.ads.RewardedAdResult
 import com.app.pubglibrary.data.AppLanguage
 import com.app.pubglibrary.data.DownloadStage
 import com.app.pubglibrary.data.FileRepository
@@ -27,6 +29,7 @@ import com.app.pubglibrary.data.LibraryFileItem
 import com.app.pubglibrary.data.NetworkReachabilityChecker
 import com.app.pubglibrary.data.PubgVersion
 import com.app.pubglibrary.data.REMOTE_CONTROL_URL
+import com.app.pubglibrary.data.RemoteCatalogResult
 import com.app.pubglibrary.data.RemoteNotice
 import com.app.pubglibrary.data.resolveThumbnailUrl
 import com.app.pubglibrary.service.FileUserService
@@ -35,6 +38,7 @@ import com.app.pubglibrary.shizuku.ShizukuStatus
 import com.app.pubglibrary.ui.DescriptionLine
 import com.app.pubglibrary.ui.DropZoneUiState
 import com.app.pubglibrary.ui.DropZoneViewModel
+import com.app.pubglibrary.ui.ItemTransferState
 import com.app.pubglibrary.ui.MainScreenContent
 import com.app.pubglibrary.ui.SnackbarEvent
 import com.app.pubglibrary.ui.i18n.EnAppStrings
@@ -42,7 +46,11 @@ import com.app.pubglibrary.ui.i18n.MmAppStrings
 import com.app.pubglibrary.ui.parseStructuredDescription
 import com.app.pubglibrary.ui.theme.DropZoneTheme
 import com.sun.net.httpserver.HttpServer
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emptyFlow
@@ -50,6 +58,11 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.test.setMain
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -895,6 +908,79 @@ class DropZoneRobolectricTest {
         composeRule.waitForIdle()
         composeRule.onNodeWithTag("network_gate_screen").assertDoesNotExist()
         composeRule.onNodeWithTag("notice_popup_dialog").assertIsDisplayed()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `required reward blocks the download until completion and omitted flag bypasses ads`() = runTest {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val repository = FileRepository(app)
+        val itemJson = """
+            {
+              "id":"test", "title":"Pack", "sizeLabel":"1 MB",
+              "downloadUrl":"https://example.com/files.zip", "fileName":"files.zip",
+              "targetSubPath":"files"
+            }
+        """.trimIndent()
+        val network = object : NetworkReachabilityChecker {
+            override suspend fun isInternetReachable() = true
+            override fun observeNetworkAvailability(): Flow<Unit> = emptyFlow()
+        }
+
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        Dispatchers.setMain(dispatcher)
+        try {
+            for (flag in listOf("", """"requireAdForDownload":true,""")) {
+                val config = checkNotNull(repository.parseRemoteConfigJson("""{${flag}"files":[${itemJson}]}"""))
+                val gated = flag.isNotEmpty()
+                assertEquals(gated, config.requireAdForDownload)
+                val item = config.files.single()
+                val viewModel = DropZoneViewModel(
+                    application = app,
+                    networkChecker = network,
+                    catalogLoader = { RemoteCatalogResult.Success(config, isSampleMode = false) }
+                )
+                val messages = mutableListOf<String>()
+                val stateJob = backgroundScope.launch(dispatcher) { viewModel.uiState.collect {} }
+                val eventJob = backgroundScope.launch(dispatcher) {
+                    viewModel.snackbarEvents.collect { messages += it.message.resolve(EnAppStrings) }
+                }
+
+                try {
+                    viewModel.selectVersion(PubgVersion.GLOBAL)
+                    runCurrent()
+                    if (gated) {
+                        for ((outcome, message) in listOf(
+                            RewardedAdResult.SKIPPED to EnAppStrings.msgRewardedAdSkipped,
+                            RewardedAdResult.UNAVAILABLE to EnAppStrings.msgRewardedAdUnavailable,
+                            RewardedAdResult.COMPLETED to EnAppStrings.msgShizukuStartServiceFirst
+                        )) {
+                            val reward = CompletableDeferred<RewardedAdResult>()
+                            viewModel.downloadAndApply(item) { reward.await() }
+                            runCurrent()
+                            assertEquals(ItemTransferState.WaitingForAd, viewModel.uiState.value.transferStates[item.id])
+                            assertTrue(messages.isEmpty())
+                            reward.complete(outcome)
+                            runCurrent()
+                            assertEquals(listOf(message), messages)
+                            assertTrue(viewModel.uiState.value.transferStates.isEmpty())
+                            messages.clear()
+                        }
+                    } else {
+                        viewModel.downloadAndApply(item) { error("No ad should be requested") }
+                        runCurrent()
+                        assertEquals(listOf(EnAppStrings.msgShizukuStartServiceFirst), messages)
+                    }
+                } finally {
+                    eventJob.cancel()
+                    stateJob.cancel()
+                    viewModel.viewModelScope.cancel()
+                    viewModel.unregisterShizukuListeners()
+                }
+            }
+        } finally {
+            Dispatchers.resetMain()
+        }
     }
 
     @Test

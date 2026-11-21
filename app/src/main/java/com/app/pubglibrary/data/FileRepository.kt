@@ -134,7 +134,8 @@ data class RemoteControlConfig(
     val announcement: String = "",
     val files: List<LibraryFileItem> = emptyList(),
     val notice: RemoteNotice? = null,
-    val thumbnails: Map<String, String> = emptyMap()
+    val thumbnails: Map<String, String> = emptyMap(),
+    val requireAdForDownload: Boolean = false
 )
 
 sealed interface RemoteCatalogResult {

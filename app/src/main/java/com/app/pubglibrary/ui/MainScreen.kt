@@ -145,6 +145,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
 import coil.compose.AsyncImagePainter
 import com.app.pubglibrary.R
+import com.app.pubglibrary.ads.RewardedAdResult
+import com.app.pubglibrary.ads.UnityBanner
 import com.app.pubglibrary.data.AppLanguage
 import com.app.pubglibrary.data.InstalledPackageInfo
 import com.app.pubglibrary.data.LibraryFileItem
@@ -178,6 +180,7 @@ import com.app.pubglibrary.ui.theme.TextSecondary
 @Composable
 fun MainScreen(
     viewModel: DropZoneViewModel,
+    showRewardedAd: suspend () -> RewardedAdResult,
     modifier: Modifier = Modifier
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
@@ -198,7 +201,8 @@ fun MainScreen(
         onRefreshCatalog = { showSnackbar -> viewModel.refreshCatalog(showSnackbar) },
         onUpdateSearchQuery = { viewModel.updateSearchQuery(it) },
         onSelectCategory = { viewModel.selectCategory(it) },
-        onDownloadAndApply = { viewModel.downloadAndApply(it) },
+        onDownloadAndApply = { viewModel.downloadAndApply(it, showRewardedAd) },
+        banner = { UnityBanner() },
         onConfirmOverwrite = { viewModel.confirmOverwrite() },
         onCancelOverwrite = { viewModel.cancelOverwrite() },
         resolveTargetPreview = { version, item, suffix ->
@@ -232,7 +236,8 @@ internal fun MainScreenContent(
     onToggleNoticeDontShowAgain: (Boolean) -> Unit = {},
     onDismissNotice: () -> Unit = {},
     onOpenNotice: () -> Unit = {},
-    onDismissRemoteNotice: (String) -> Unit = {}
+    onDismissRemoteNotice: (String) -> Unit = {},
+    banner: @Composable () -> Unit = {}
 ) {
     val appStrings = remember(uiState.language) { stringsFor(uiState.language) }
     val latestStrings by rememberUpdatedState(appStrings)
@@ -384,7 +389,7 @@ internal fun MainScreenContent(
                         }
 
                         Box(
-                            modifier = Modifier.fillMaxSize(),
+                            modifier = Modifier.weight(1f).fillMaxWidth(),
                             contentAlignment = Alignment.TopCenter
                         ) {
                             AnimatedContent(
@@ -456,6 +461,7 @@ internal fun MainScreenContent(
                                 }
                             }
                         }
+                        banner()
                     }
                 }
             }
@@ -1837,7 +1843,7 @@ private fun LibraryFileCard(
         targetValue = when (transferState) {
             is ItemTransferState.Downloading -> transferState.progress.coerceIn(0f, 1f)
             ItemTransferState.CheckingTarget, ItemTransferState.Applying -> 1f
-            ItemTransferState.WaitingForPermission, null -> 0f
+            ItemTransferState.WaitingForAd, ItemTransferState.WaitingForPermission, null -> 0f
         },
         animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
         label = "transfer_progress"
@@ -2010,7 +2016,9 @@ private fun LibraryFileCard(
                 exit = shrinkVertically(tween(140)) + fadeOut(tween(120))
             ) {
                 Column(modifier = Modifier.padding(top = 12.dp)) {
-                    if (transferState is ItemTransferState.Downloading && transferState.progress < 0f) {
+                    if (transferState == ItemTransferState.WaitingForAd ||
+                        (transferState is ItemTransferState.Downloading && transferState.progress < 0f)
+                    ) {
                         LinearProgressIndicator(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -2083,6 +2091,7 @@ private fun LibraryFileCard(
                             strings.statusDownloadingIndeterminate
                         }
                     }
+                    transferState is ItemTransferState.WaitingForAd -> strings.statusLoadingRewardedAd
                     transferState is ItemTransferState.WaitingForPermission -> strings.shizukuPermissionTitle
                     transferState is ItemTransferState.CheckingTarget -> strings.statusCheckingTarget
                     transferState is ItemTransferState.Applying -> {

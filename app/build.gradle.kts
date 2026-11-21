@@ -16,7 +16,7 @@ android {
     applicationId = "com.aistudio.dropzonemanager.k7m2xp"
     minSdk = 24
     targetSdk = 36
-    versionCode = 2
+    versionCode = 3
     versionName = "3.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -129,6 +129,7 @@ dependencies {
   // implementation(libs.retrofit)
   implementation(libs.shizuku.api)
   implementation(libs.shizuku.provider)
+  implementation("com.unity3d.ads:unity-ads:4.16.6")
   testImplementation(libs.androidx.compose.ui.test.junit4)
   testImplementation(libs.androidx.core)
   testImplementation(libs.androidx.junit)

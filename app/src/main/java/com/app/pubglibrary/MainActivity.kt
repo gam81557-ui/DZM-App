@@ -7,9 +7,13 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
+import androidx.lifecycle.lifecycleScope
+import com.app.pubglibrary.ads.RewardedAdResult
+import com.app.pubglibrary.ads.UnityDownloadAds
 import com.app.pubglibrary.ui.DropZoneViewModel
 import com.app.pubglibrary.ui.MainScreen
 import com.app.pubglibrary.ui.theme.DropZoneTheme
+import kotlinx.coroutines.async
 
 class MainActivity : ComponentActivity() {
 
@@ -23,8 +27,18 @@ class MainActivity : ComponentActivity() {
         )
         setContent {
             DropZoneTheme {
-                MainScreen(viewModel = viewModel)
+                MainScreen(viewModel = viewModel, showRewardedAd = ::showRewardedAd)
             }
+        }
+    }
+
+    private suspend fun showRewardedAd(): RewardedAdResult {
+        // The ad must not outlive the Activity it is shown from.
+        val ad = lifecycleScope.async { UnityDownloadAds.showRewarded(this@MainActivity) }
+        return try {
+            ad.await()
+        } finally {
+            ad.cancel()
         }
     }
 }
