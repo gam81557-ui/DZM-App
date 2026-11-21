@@ -8,9 +8,11 @@ import android.content.pm.PackageManager
 import android.os.IBinder
 import com.app.pubglibrary.BuildConfig
 import com.app.pubglibrary.IFileService
+import com.app.pubglibrary.IFileSource
 import com.app.pubglibrary.service.FileUserService
 import com.app.pubglibrary.ui.i18n.EnAppStrings
 import com.app.pubglibrary.ui.i18n.UiText
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -21,6 +23,8 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import rikka.shizuku.Shizuku
+import java.io.File
+import java.io.FileNotFoundException
 import kotlin.coroutines.resume
 
 sealed interface ShizukuStatus {
@@ -38,8 +42,13 @@ class ShizukuHelper(private val context: Context) {
     companion object {
         const val REQUEST_CODE_PERMISSION = 1001
         const val SHIZUKU_PACKAGE_NAME = "rikka.shizuku"
+        // Bump when the Binder interface changes so Shizuku replaces the old service.
+        private const val FILE_SERVICE_VERSION = 2
         private const val SERVICE_BIND_TIMEOUT_MS = 10_000L
     }
+
+    private var permissionRejectedByServer = false
+    private var permissionRequest: CompletableDeferred<Boolean>? = null
 
     private val _status = MutableStateFlow(computeStatus())
     val status: StateFlow<ShizukuStatus> = _status.asStateFlow()
@@ -56,23 +65,28 @@ class ShizukuHelper(private val context: Context) {
             .daemon(false)
             .processNameSuffix("file_service")
             .debuggable(BuildConfig.DEBUG)
-            .version(BuildConfig.VERSION_CODE)
+            .version(FILE_SERVICE_VERSION)
     }
 
     private val binderReceivedListener = Shizuku.OnBinderReceivedListener {
+        permissionRejectedByServer = false
         refreshStatus()
     }
 
     private val binderDeadListener = Shizuku.OnBinderDeadListener {
         boundService = null
         activeConnection = null
+        finishPermissionRequest(false)
         refreshStatus()
     }
 
     private val permissionResultListener =
-        Shizuku.OnRequestPermissionResultListener { requestCode, _ ->
+        Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
             if (requestCode == REQUEST_CODE_PERMISSION) {
+                val granted = grantResult == PackageManager.PERMISSION_GRANTED
+                if (granted) permissionRejectedByServer = false
                 refreshStatus()
+                finishPermissionRequest(granted)
             }
         }
 
@@ -91,6 +105,7 @@ class ShizukuHelper(private val context: Context) {
         Shizuku.removeBinderDeadListener(binderDeadListener)
         Shizuku.removeRequestPermissionResultListener(permissionResultListener)
         listenersRegistered = false
+        finishPermissionRequest(false)
         unbindUserServiceQuietly()
     }
 
@@ -111,7 +126,8 @@ class ShizukuHelper(private val context: Context) {
             if (Shizuku.isPreV11()) {
                 false
             } else {
-                Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+                Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED &&
+                    !permissionRejectedByServer
             }
         } catch (_: Throwable) {
             false
@@ -119,27 +135,66 @@ class ShizukuHelper(private val context: Context) {
         return if (granted) ShizukuStatus.Connected else ShizukuStatus.PermissionRequired
     }
 
-    fun requestPermission(): Boolean {
-        val binderAlive = try {
-            Shizuku.pingBinder()
-        } catch (_: Throwable) {
-            false
-        }
-        if (!binderAlive) {
-            refreshStatus()
-            return false
-        }
+    // Permission requests and their callbacks run on the main thread.
+    private fun finishPermissionRequest(granted: Boolean) {
+        val request = permissionRequest
+        permissionRequest = null
+        request?.complete(granted)
+    }
+
+    private fun startPermissionRequest(): CompletableDeferred<Boolean>? {
+        permissionRequest?.let { return it }
+        val request = CompletableDeferred<Boolean>()
+        permissionRequest = request
         return try {
-            if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
-                refreshStatus()
-                true
-            } else {
-                Shizuku.requestPermission(REQUEST_CODE_PERMISSION)
-                true
+            if (!Shizuku.pingBinder() || Shizuku.isPreV11()) {
+                finishPermissionRequest(false)
+                return null
             }
-        } catch (_: Throwable) {
+            Shizuku.requestPermission(REQUEST_CODE_PERMISSION)
+            request
+        } catch (_: Exception) {
+            finishPermissionRequest(false)
             refreshStatus()
-            false
+            null
+        }
+    }
+
+    fun requestPermission(): Boolean {
+        registerListeners()
+        refreshStatus()
+        return when (_status.value) {
+            ShizukuStatus.Connected -> true
+            ShizukuStatus.NotRunning -> false
+            ShizukuStatus.PermissionRequired -> startPermissionRequest() != null
+        }
+    }
+
+    suspend fun awaitPermission() = withContext(Dispatchers.Main.immediate) {
+        registerListeners()
+        refreshStatus()
+        if (_status.value == ShizukuStatus.PermissionRequired) {
+            val granted = startPermissionRequest()?.await() == true
+            refreshStatus()
+            if (!granted && _status.value != ShizukuStatus.NotRunning) {
+                throw permissionRequired()
+            }
+        }
+        requirePermission()
+    }
+
+    private fun permissionRequired() = ShizukuLocalizedException(
+        UiText.Localized { it.errShizukuPermissionRequiredService }
+    )
+
+    private fun requirePermission() {
+        refreshStatus()
+        when (_status.value) {
+            ShizukuStatus.Connected -> Unit
+            ShizukuStatus.PermissionRequired -> throw permissionRequired()
+            ShizukuStatus.NotRunning -> throw ShizukuLocalizedException(
+                UiText.Localized { it.msgShizukuStartServiceFirst }
+            )
         }
     }
 
@@ -170,7 +225,7 @@ class ShizukuHelper(private val context: Context) {
     ): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
             val service = acquireUserService()
-            val response = service.copyFile(sourcePath, targetDir, fileName)
+            val response = withDownloadedFile(sourcePath) { service.copyFile(it, targetDir, fileName) }
             if (response != "OK") {
                 val rawMessage = response?.removePrefix("ERROR:")?.takeIf { it.isNotBlank() }
                 throw ShizukuLocalizedException(
@@ -188,7 +243,7 @@ class ShizukuHelper(private val context: Context) {
         withContext(Dispatchers.IO) {
             runCatching {
                 val service = acquireUserService()
-                service.zipHasExistingFiles(sourcePath, targetDir)
+                withDownloadedFile(sourcePath) { service.zipHasExistingFiles(it, targetDir) }
             }
         }
 
@@ -196,7 +251,7 @@ class ShizukuHelper(private val context: Context) {
         withContext(Dispatchers.IO) {
             runCatching {
                 val service = acquireUserService()
-                val response = service.extractZip(sourcePath, targetDir)
+                val response = withDownloadedFile(sourcePath) { service.extractZip(it, targetDir) }
                 if (response != "OK") {
                     val rawMessage = response?.removePrefix("ERROR:")?.takeIf { it.isNotBlank() }
                     throw ShizukuLocalizedException(
@@ -210,40 +265,64 @@ class ShizukuHelper(private val context: Context) {
             }
         }
 
-    private suspend fun acquireUserService(): IFileService = serviceMutex.withLock {
-        val currentStatus = computeStatus()
-        _status.value = currentStatus
-        if (currentStatus != ShizukuStatus.Connected) {
-            throw ShizukuLocalizedException(
-                when (currentStatus) {
-                    ShizukuStatus.PermissionRequired ->
-                        UiText.Localized { it.errShizukuPermissionRequiredService }
-                    ShizukuStatus.NotRunning ->
-                        UiText.Localized { it.errShizukuServiceNotRunning }
-                    ShizukuStatus.Connected -> UiText.Raw("")
-                }
-            )
+    private inline fun <T> withDownloadedFile(sourcePath: String, read: (IFileSource) -> T): T {
+        val input = try {
+            val file = File(sourcePath)
+            if (!file.isFile || file.length() == 0L) throw FileNotFoundException()
+            file.inputStream()
+        } catch (_: FileNotFoundException) {
+            throw ShizukuLocalizedException(UiText.Localized { it.errOpenDownloadedFile })
         }
+        return input.use { read(DownloadFileSource(it)) }
+    }
 
+    private suspend fun acquireUserService(): IFileService = withContext(Dispatchers.Main.immediate) {
+        awaitPermission()
+        try {
+            serviceMutex.withLock { bindUserService() }
+        } catch (_: SecurityException) {
+            // The SDK can cache a grant that the server has since revoked.
+            permissionRejectedByServer = true
+            awaitPermission()
+            try {
+                serviceMutex.withLock { bindUserService() }
+            } catch (_: SecurityException) {
+                permissionRejectedByServer = true
+                refreshStatus()
+                throw permissionRequired()
+            }
+        }
+    }
+
+    private suspend fun bindUserService(): IFileService {
+        requirePermission()
         val existing = boundService
         if (existing != null && existing.asBinder().pingBinder()) {
-            return@withLock existing
+            return existing
         }
 
         unbindUserServiceQuietly()
 
+        return try {
+            awaitServiceConnection()
+        } catch (t: Exception) {
+            unbindUserServiceQuietly()
+            throw t
+        }
+    }
+
+    private suspend fun awaitServiceConnection(): IFileService =
         withTimeout(SERVICE_BIND_TIMEOUT_MS) {
             suspendCancellableCoroutine { continuation ->
                 val connection = object : ServiceConnection {
                     override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+                        if (!continuation.isActive || activeConnection !== this) return
                         val fileService = IFileService.Stub.asInterface(service)
                         if (fileService != null) {
                             boundService = fileService
-                            activeConnection = this
-                            if (continuation.isActive) {
-                                continuation.resume(fileService)
-                            }
-                        } else if (continuation.isActive) {
+                            continuation.resume(fileService)
+                        } else {
+                            activeConnection = null
                             continuation.resumeWith(
                                 Result.failure(
                                     ShizukuLocalizedException(
@@ -255,31 +334,29 @@ class ShizukuHelper(private val context: Context) {
                     }
 
                     override fun onServiceDisconnected(name: ComponentName?) {
-                        boundService = null
-                        activeConnection = null
+                        if (activeConnection === this) {
+                            boundService = null
+                            activeConnection = null
+                        }
                     }
                 }
 
-                continuation.invokeOnCancellation {
-                    runCatching { Shizuku.unbindUserService(userServiceArgs, connection, true) }
-                }
-
+                activeConnection = connection
                 try {
+                    requirePermission()
                     Shizuku.bindUserService(userServiceArgs, connection)
-                } catch (t: Throwable) {
-                    if (continuation.isActive) {
-                        continuation.resumeWith(Result.failure(t))
-                    }
+                } catch (t: Exception) {
+                    activeConnection = null
+                    continuation.resumeWith(Result.failure(t))
                 }
             }
         }
-    }
 
     private fun unbindUserServiceQuietly() {
         val connection = activeConnection
         boundService = null
         activeConnection = null
-        if (connection != null) {
+        if (connection != null && computeStatus() == ShizukuStatus.Connected) {
             runCatching {
                 Shizuku.unbindUserService(userServiceArgs, connection, true)
             }

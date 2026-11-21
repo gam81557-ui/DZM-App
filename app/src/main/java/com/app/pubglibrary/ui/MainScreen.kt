@@ -1759,7 +1759,7 @@ private fun LibraryFileCard(
         targetValue = when (transferState) {
             is ItemTransferState.Downloading -> transferState.progress.coerceIn(0f, 1f)
             ItemTransferState.CheckingTarget, ItemTransferState.Applying -> 1f
-            null -> 0f
+            ItemTransferState.WaitingForPermission, null -> 0f
         },
         animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
         label = "transfer_progress"
@@ -1991,6 +1991,7 @@ private fun LibraryFileCard(
                             strings.statusDownloadingIndeterminate
                         }
                     }
+                    transferState is ItemTransferState.WaitingForPermission -> strings.shizukuPermissionTitle
                     transferState is ItemTransferState.CheckingTarget -> strings.statusCheckingTarget
                     transferState is ItemTransferState.Applying -> {
                         if (isZip) strings.statusExtractingViaShizuku else strings.statusApplyingViaShizuku

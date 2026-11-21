@@ -2,6 +2,7 @@ package com.app.pubglibrary
 
 import android.app.Application
 import android.content.Context
+import android.content.ContextWrapper
 import android.os.Looper
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -15,6 +16,7 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.test.core.app.ApplicationProvider
 import com.app.pubglibrary.data.AppLanguage
+import com.app.pubglibrary.data.DownloadStage
 import com.app.pubglibrary.data.FileRepository
 import com.app.pubglibrary.data.LanguagePreferences
 import com.app.pubglibrary.data.LibraryFileItem
@@ -22,6 +24,7 @@ import com.app.pubglibrary.data.NetworkReachabilityChecker
 import com.app.pubglibrary.data.PubgVersion
 import com.app.pubglibrary.data.REMOTE_CONTROL_URL
 import com.app.pubglibrary.service.FileUserService
+import com.app.pubglibrary.shizuku.DownloadFileSource
 import com.app.pubglibrary.shizuku.ShizukuStatus
 import com.app.pubglibrary.ui.DescriptionLine
 import com.app.pubglibrary.ui.DropZoneUiState
@@ -32,10 +35,12 @@ import com.app.pubglibrary.ui.i18n.EnAppStrings
 import com.app.pubglibrary.ui.i18n.MmAppStrings
 import com.app.pubglibrary.ui.parseStructuredDescription
 import com.app.pubglibrary.ui.theme.DropZoneTheme
+import com.sun.net.httpserver.HttpServer
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -49,8 +54,10 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows
 import org.robolectric.annotation.Config
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.net.InetSocketAddress
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.ZipEntry
@@ -155,6 +162,67 @@ class DropZoneRobolectricTest {
     }
 
     @Test
+    fun `download follows redirects and stages a missing archive without replacing it on invalid response`() {
+        val tempRoot = createTempDirectory(prefix = "dropzone_download_test").toFile()
+        val context = object : ContextWrapper(ApplicationProvider.getApplicationContext<Context>()) {
+            override fun getFilesDir(): File = tempRoot
+        }
+        val expectedPayload = "archive fixture"
+        val archive = ByteArrayOutputStream()
+        ZipOutputStream(archive).use { output ->
+            output.putNextEntry(ZipEntry("fixture.txt"))
+            output.write(expectedPayload.toByteArray())
+            output.closeEntry()
+        }
+        val archiveBytes = archive.toByteArray()
+        val validResponse = AtomicBoolean(true)
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.createContext("/release") { exchange ->
+            exchange.responseHeaders.add("Location", "/archive")
+            exchange.sendResponseHeaders(302, -1)
+            exchange.close()
+        }
+        server.createContext("/archive") { exchange ->
+            val bytes = if (validResponse.get()) archiveBytes else "<html>Not a ZIP</html>".toByteArray()
+            exchange.sendResponseHeaders(200, bytes.size.toLong())
+            exchange.responseBody.use { it.write(bytes) }
+        }
+        server.start()
+        try {
+            val repository = FileRepository(context)
+            val item = LibraryFileItem(
+                id = "archive",
+                title = "Archive",
+                versionKey = "all",
+                sizeLabel = "ZIP",
+                downloadUrl = "http://127.0.0.1:${server.address.port}/release",
+                targetSubPath = "",
+                fileName = "files.zip"
+            )
+            val staged = File(tempRoot, "downloads/all/files.zip")
+            assertFalse(staged.exists())
+            val stages = runBlocking { repository.downloadFile(item).toList() }
+            assertTrue(stages.any { it is DownloadStage.Downloading && it.progress > 0f })
+            assertEquals(DownloadStage.Completed(staged), stages.last())
+            val target = File(tempRoot, "target")
+            val applied = staged.inputStream().use {
+                FileUserService().extractZip(DownloadFileSource(it), target.absolutePath)
+            }
+            assertEquals("OK", applied)
+            assertEquals(expectedPayload, File(target, "fixture.txt").readText())
+
+            validResponse.set(false)
+            val failure = runBlocking { repository.downloadFile(item).toList().last() }
+            assertEquals(EnAppStrings.errInvalidDownloadedZip, (failure as DownloadStage.Failed).message)
+            assertTrue(staged.readBytes().contentEquals(archiveBytes))
+            assertEquals(listOf("files.zip"), staged.parentFile?.list()?.toList())
+        } finally {
+            server.stop(0)
+            tempRoot.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `extractZip preserves existing folders and only overwrites matching pak files`() {
         val tempRoot = createTempDirectory(prefix = "dropzone_zip_test").toFile()
         try {
@@ -188,7 +256,9 @@ class DropZoneRobolectricTest {
             }
 
             val service = FileUserService()
-            val result = service.extractZip(zipFile.absolutePath, targetDir.absolutePath)
+            val result = zipFile.inputStream().use { input ->
+                service.extractZip(DownloadFileSource(input), targetDir.absolutePath)
+            }
             assertEquals("OK", result)
 
             assertEquals("NEW_PAK", matchingPak.readText())
@@ -214,7 +284,9 @@ class DropZoneRobolectricTest {
 
             val targetDir = File(tempRoot, "com.tencent.ig")
             val service = FileUserService()
-            val result = service.extractZip(zipFile.absolutePath, targetDir.absolutePath)
+            val result = zipFile.inputStream().use { input ->
+                service.extractZip(DownloadFileSource(input), targetDir.absolutePath)
+            }
             assertTrue(result.startsWith("ERROR:"))
             assertFalse(File(tempRoot, "escaped.txt").exists())
         } finally {

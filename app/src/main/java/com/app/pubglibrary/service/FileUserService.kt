@@ -3,10 +3,13 @@ package com.app.pubglibrary.service
 import android.content.Context
 import androidx.annotation.Keep
 import com.app.pubglibrary.IFileService
+import com.app.pubglibrary.IFileSource
 import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.IOException
+import java.io.InputStream
 import java.util.zip.ZipInputStream
 import kotlin.system.exitProcess
 
@@ -32,71 +35,68 @@ class FileUserService : IFileService.Stub {
         }
     }
 
-    override fun copyFile(sourcePath: String?, targetDir: String?, fileName: String?): String {
-        if (sourcePath.isNullOrBlank() || targetDir.isNullOrBlank() || fileName.isNullOrBlank()) {
-            return "ERROR:Invalid source or target path."
-        }
-        if (fileName.contains("..") || fileName.contains('/') || fileName.contains('\\')) {
-            return "ERROR:Invalid file name."
-        }
-
+    override fun copyFile(source: IFileSource?, targetDir: String?, fileName: String?): String {
+        if (source == null) return "ERROR:Missing downloaded file."
         return try {
-            val sourceFile = File(sourcePath)
-            if (!sourceFile.exists() || !sourceFile.isFile) {
-                return "ERROR:Downloaded file not found at $sourcePath"
+            openSource(source).use { input ->
+                copyFileFromStream(input, targetDir, fileName)
             }
-
-            val destDir = File(targetDir)
-            if (!destDir.exists() && !destDir.mkdirs()) {
-                return "ERROR:Failed to create directory $targetDir"
-            }
-
-            val destFile = File(destDir, fileName)
-            val tempFile = File(destDir, "$fileName.tmp")
-
-            FileInputStream(sourceFile).use { input ->
-                FileOutputStream(tempFile, false).use { output ->
-                    val buffer = ByteArray(16 * 1024)
-                    while (true) {
-                        val read = input.read(buffer)
-                        if (read <= 0) break
-                        output.write(buffer, 0, read)
-                    }
-                    output.fd.sync()
-                }
-            }
-
-            if (destFile.exists() && !destFile.delete()) {
-                tempFile.delete()
-                return "ERROR:Unable to replace existing file ${destFile.absolutePath}"
-            }
-
-            if (!tempFile.renameTo(destFile)) {
-                FileInputStream(tempFile).use { input ->
-                    FileOutputStream(destFile, false).use { output ->
-                        input.copyTo(output)
-                        output.fd.sync()
-                    }
-                }
-                tempFile.delete()
-            }
-
-            "OK"
         } catch (t: Throwable) {
             "ERROR:${t.message ?: t.javaClass.simpleName}"
         }
     }
 
-    override fun zipHasExistingFiles(sourcePath: String?, targetDir: String?): Boolean {
-        if (sourcePath.isNullOrBlank() || targetDir.isNullOrBlank()) return false
-        return try {
-            val sourceFile = File(sourcePath)
-            if (!sourceFile.exists() || !sourceFile.isFile) return false
-            val destRoot = File(targetDir)
-            if (!destRoot.exists()) return false
-            val canonicalRoot = destRoot.canonicalPath
+    private fun copyFileFromStream(
+        input: InputStream,
+        targetDir: String?,
+        fileName: String?
+    ): String {
+        if (targetDir.isNullOrBlank() || fileName.isNullOrBlank()) {
+            return "ERROR:Invalid target path."
+        }
+        if (fileName.contains("..") || fileName.contains('/') || fileName.contains('\\')) {
+            return "ERROR:Invalid file name."
+        }
 
-            ZipInputStream(BufferedInputStream(FileInputStream(sourceFile))).use { zis ->
+        val destDir = File(targetDir)
+        if (!destDir.exists() && !destDir.mkdirs()) {
+            return "ERROR:Failed to create directory $targetDir"
+        }
+
+        val destFile = File(destDir, fileName)
+        val tempFile = File(destDir, "$fileName.tmp")
+
+        FileOutputStream(tempFile, false).use { output ->
+            input.copyTo(output)
+            output.fd.sync()
+        }
+
+        if (destFile.exists() && !destFile.delete()) {
+            tempFile.delete()
+            return "ERROR:Unable to replace existing file ${destFile.absolutePath}"
+        }
+
+        if (!tempFile.renameTo(destFile)) {
+            FileInputStream(tempFile).use { input ->
+                FileOutputStream(destFile, false).use { output ->
+                    input.copyTo(output)
+                    output.fd.sync()
+                }
+            }
+            tempFile.delete()
+        }
+
+        return "OK"
+    }
+
+    override fun zipHasExistingFiles(source: IFileSource?, targetDir: String?): Boolean {
+        if (source == null) return false
+        return try {
+            openZip(source).use { zis ->
+                if (targetDir.isNullOrBlank()) return false
+                val destRoot = File(targetDir)
+                if (!destRoot.exists()) return false
+                val canonicalRoot = destRoot.canonicalPath
                 while (true) {
                     val entry = zis.nextEntry ?: break
                     val cleanName = entry.name.trimStart('/')
@@ -119,25 +119,17 @@ class FileUserService : IFileService.Stub {
         }
     }
 
-    override fun extractZip(sourcePath: String?, targetDir: String?): String {
-        if (sourcePath.isNullOrBlank() || targetDir.isNullOrBlank()) {
-            return "ERROR:Invalid zip source or target directory."
-        }
-
+    override fun extractZip(source: IFileSource?, targetDir: String?): String {
+        if (source == null) return "ERROR:Missing downloaded archive."
         return try {
-            val sourceFile = File(sourcePath)
-            if (!sourceFile.exists() || !sourceFile.isFile) {
-                return "ERROR:Downloaded archive not found at $sourcePath"
-            }
-
-            val destRoot = File(targetDir)
-            if (!destRoot.exists() && !destRoot.mkdirs()) {
-                return "ERROR:Failed to create directory $targetDir"
-            }
-            val canonicalRoot = destRoot.canonicalPath
-
-            var entryCount = 0
-            ZipInputStream(BufferedInputStream(FileInputStream(sourceFile))).use { zis ->
+            openZip(source).use { zis ->
+                if (targetDir.isNullOrBlank()) return "ERROR:Invalid zip target directory."
+                val destRoot = File(targetDir)
+                if (!destRoot.exists() && !destRoot.mkdirs()) {
+                    return "ERROR:Failed to create directory $targetDir"
+                }
+                val canonicalRoot = destRoot.canonicalPath
+                var entryCount = 0
                 val buffer = ByteArray(16 * 1024)
                 while (true) {
                     val entry = zis.nextEntry ?: break
@@ -205,17 +197,31 @@ class FileUserService : IFileService.Stub {
                     }
                     zis.closeEntry()
                 }
+                if (entryCount == 0) "ERROR:Zip archive is empty or invalid." else "OK"
             }
-
-            if (entryCount == 0) {
-                return "ERROR:Zip archive is empty or invalid."
-            }
-
-            "OK"
         } catch (t: Throwable) {
             "ERROR:${t.message ?: t.javaClass.simpleName}"
         }
     }
+
+    private fun openSource(source: IFileSource): InputStream = object : InputStream() {
+        private val singleByte = ByteArray(1)
+
+        override fun read(): Int =
+            if (read(singleByte, 0, 1) == -1) -1 else singleByte[0].toInt() and 0xff
+
+        override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+            if (length == 0) return 0
+            val chunk = source.read(length) ?: throw IOException("Missing download data.")
+            if (chunk.isEmpty()) return -1
+            if (chunk.size > length) throw IOException("Invalid download data.")
+            chunk.copyInto(buffer, offset)
+            return chunk.size
+        }
+    }
+
+    private fun openZip(source: IFileSource) =
+        ZipInputStream(BufferedInputStream(openSource(source), 64 * 1024))
 
     override fun destroy() {
         exitProcess(0)

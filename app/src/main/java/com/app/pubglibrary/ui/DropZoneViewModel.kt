@@ -36,6 +36,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 @Immutable
 sealed interface ItemTransferState {
     data class Downloading(val progress: Float) : ItemTransferState
+    data object WaitingForPermission : ItemTransferState
     data object CheckingTarget : ItemTransferState
     data object Applying : ItemTransferState
 }
@@ -420,7 +421,7 @@ class DropZoneViewModel(
                                 it.matchesVersion(currentPrompt.version)
                         }
                         if (!stillEnabled) {
-                            _pendingOverwrite.value = null
+                        _pendingOverwrite.value = null
                         }
                     }
 
@@ -495,90 +496,79 @@ class DropZoneViewModel(
         val version = _selectedVersion.value ?: return
         if (_transferStates.value.containsKey(item.id)) return
 
-        // Check Shizuku permission first
-        shizukuHelper.refreshStatus()
-        when (shizukuHelper.status.value) {
-            ShizukuStatus.NotRunning -> {
-                emitSnackbar(
-                    UiText.Localized { it.msgShizukuStartServiceFirst },
-                    SnackbarKind.ERROR
-                )
-                return
-            }
-            ShizukuStatus.PermissionRequired -> {
-                shizukuHelper.requestPermission()
-                emitSnackbar(
-                    UiText.Localized { it.msgShizukuPermissionPromptHint },
-                    SnackbarKind.ERROR
-                )
-                return
-            }
-            ShizukuStatus.Connected -> Unit
-        }
-
+        _transferStates.update { it + (item.id to ItemTransferState.WaitingForPermission) }
         viewModelScope.launch {
-            var completedFilePath: String? = null
-            repository.downloadFile(item).collect { stage ->
-                when (stage) {
-                    is DownloadStage.Downloading -> {
-                        _transferStates.update {
-                            it + (item.id to ItemTransferState.Downloading(stage.progress))
-                        }
-                    }
-                    is DownloadStage.Failed -> {
-                        _transferStates.update { it - item.id }
-                        emitSnackbar(stage.uiText, SnackbarKind.ERROR)
-                    }
-                    is DownloadStage.Completed -> {
-                        completedFilePath = stage.localFile.absolutePath
+            try {
+                processDownloadAndApply(item, version)
+            } catch (err: ShizukuLocalizedException) {
+                emitSnackbar(err.uiText, SnackbarKind.ERROR)
+            } finally {
+                _transferStates.update { it - item.id }
+            }
+        }
+    }
+
+    private suspend fun processDownloadAndApply(item: LibraryFileItem, version: PubgVersion) {
+        shizukuHelper.awaitPermission()
+
+        var completedFilePath: String? = null
+        repository.downloadFile(item).collect { stage ->
+            when (stage) {
+                is DownloadStage.Downloading -> {
+                    _transferStates.update {
+                        it + (item.id to ItemTransferState.Downloading(stage.progress))
                     }
                 }
+                is DownloadStage.Failed -> {
+                    emitSnackbar(stage.uiText, SnackbarKind.ERROR)
+                }
+                is DownloadStage.Completed -> {
+                    completedFilePath = stage.localFile.absolutePath
+                }
             }
+        }
 
-            val stagedPath = completedFilePath ?: return@launch
-            _transferStates.update { it + (item.id to ItemTransferState.CheckingTarget) }
+        val stagedPath = completedFilePath ?: return
+        _transferStates.update { it + (item.id to ItemTransferState.CheckingTarget) }
 
-            val targetDir = repository.resolveTargetDir(version.packageName, item.targetSubPath)
-            val isZip = repository.isZipFile(item)
+        val targetDir = repository.resolveTargetDir(version.packageName, item.targetSubPath)
+        val isZip = repository.isZipFile(item)
 
-            if (isZip) {
-                // Replace matching .pak files automatically without prompting
-                performShizukuApply(item, version, stagedPath, targetDir, isZip = true)
-            } else {
-                val fullTargetPath = "$targetDir/${item.fileName}"
-                val existsResult = shizukuHelper.checkTargetFileExists(targetDir, item.fileName)
-                existsResult.fold(
-                    onSuccess = { exists ->
-                        if (exists) {
-                            _transferStates.update { it - item.id }
-                            _pendingOverwrite.value = OverwritePrompt(
-                                item = item,
-                                version = version,
-                                stagedFilePath = stagedPath,
-                                targetDir = targetDir,
-                                fullTargetPath = fullTargetPath,
-                                isZipArchive = false
-                            )
-                        } else {
-                            performShizukuApply(item, version, stagedPath, targetDir, isZip = false)
-                        }
-                    },
-                    onFailure = { err ->
-                        _transferStates.update { it - item.id }
-                        emitSnackbar(
-                            UiText.Localized { strings ->
-                                val detail = when (err) {
-                                    is ShizukuLocalizedException -> err.uiText.resolve(strings)
-                                    else -> err.message?.takeIf { it.isNotBlank() }
-                                        ?: strings.errShizukuBindFailed
-                                }
-                                strings.msgShizukuCheckFailedFormat(detail)
-                            },
-                            SnackbarKind.ERROR
+        if (isZip) {
+            // Replace matching .pak files automatically without prompting
+            performShizukuApply(item, version, stagedPath, targetDir, isZip = true)
+        } else {
+            val fullTargetPath = "$targetDir/${item.fileName}"
+            val existsResult = shizukuHelper.checkTargetFileExists(targetDir, item.fileName)
+            existsResult.fold(
+                onSuccess = { exists ->
+                    if (exists) {
+                        _pendingOverwrite.value = OverwritePrompt(
+                            item = item,
+                            version = version,
+                            stagedFilePath = stagedPath,
+                            targetDir = targetDir,
+                            fullTargetPath = fullTargetPath,
+                            isZipArchive = false
                         )
+                    } else {
+                        performShizukuApply(item, version, stagedPath, targetDir, isZip = false)
                     }
-                )
-            }
+                },
+                onFailure = { err ->
+                    emitSnackbar(
+                        UiText.Localized { strings ->
+                            val detail = when (err) {
+                                is ShizukuLocalizedException -> err.uiText.resolve(strings)
+                                else -> err.message?.takeIf { it.isNotBlank() }
+                                    ?: strings.errShizukuBindFailed
+                            }
+                            strings.msgShizukuCheckFailedFormat(detail)
+                        },
+                        SnackbarKind.ERROR
+                    )
+                }
+            )
         }
     }
 
@@ -620,12 +610,15 @@ class DropZoneViewModel(
         isZip: Boolean
     ) {
         _transferStates.update { it + (item.id to ItemTransferState.Applying) }
-        val result = if (isZip) {
-            shizukuHelper.extractZipToTarget(stagedPath, targetDir)
-        } else {
-            shizukuHelper.copyFileToTarget(stagedPath, targetDir, item.fileName)
+        val result = try {
+            if (isZip) {
+                shizukuHelper.extractZipToTarget(stagedPath, targetDir)
+            } else {
+                shizukuHelper.copyFileToTarget(stagedPath, targetDir, item.fileName)
+            }
+        } finally {
+            _transferStates.update { it - item.id }
         }
-        _transferStates.update { it - item.id }
         result.fold(
             onSuccess = {
                 _appliedItemIds.update { it + item.id }
