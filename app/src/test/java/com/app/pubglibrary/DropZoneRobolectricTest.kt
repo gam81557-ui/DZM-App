@@ -92,7 +92,7 @@ class DropZoneRobolectricTest {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val repo = FileRepository(context)
         assertEquals(
-            "https://raw.githubusercontent.com/gam81557-ui/pubg-control/refs/heads/main/files.json",
+            "https://raw.githubusercontent.com/gam81557-ui/DZM-V3/refs/heads/main/files.json",
             REMOTE_CONTROL_URL
         )
         assertFalse(repo.isSampleModeConfigured())
@@ -181,6 +181,12 @@ class DropZoneRobolectricTest {
             item.resolveThumbnailUrl(mapOf(item.fileName to "file:///preview.png", item.title to "https://example.com/title.png"))
         )
         assertEquals(null, item.resolveThumbnailUrl(emptyMap()))
+
+        val disabledNoticeConfig = requireNotNull(repo.parseRemoteConfigJson(
+            """{"notice":{"enabled":false,"id":"disabled","title":"Hidden","message":"Still parsed"}}"""
+        ))
+        assertEquals(RemoteNotice(false, "disabled", "info", "Hidden", "Still parsed"), disabledNoticeConfig.notice)
+        assertFalse(requireNotNull(disabledNoticeConfig.notice).isVisible(false, emptySet()))
 
         val legacyConfig = requireNotNull(repo.parseRemoteConfigJson("""{"announcement":"Legacy"}"""))
         assertEquals("Legacy", legacyConfig.announcement)

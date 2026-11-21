@@ -33,7 +33,7 @@ import java.util.zip.ZipFile
  * When set to a real raw JSON URL, the app strictly uses the remote JSON configuration.
  */
 const val REMOTE_CONTROL_URL =
-    "https://raw.githubusercontent.com/gam81557-ui/pubg-control/refs/heads/main/files.json"
+    "https://raw.githubusercontent.com/gam81557-ui/DZM-V3/refs/heads/main/files.json"
 
 private const val PLACEHOLDER_CONTROL_URL = "REPLACE_WITH_YOUR_JSON_URL"
 
