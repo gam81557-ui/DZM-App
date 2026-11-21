@@ -6,7 +6,6 @@ import com.app.pubglibrary.IFileService
 import com.app.pubglibrary.IFileSource
 import java.io.BufferedInputStream
 import java.io.File
-import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
@@ -64,29 +63,25 @@ class FileUserService : IFileService.Stub {
         }
 
         val destFile = File(destDir, fileName)
-        val tempFile = File(destDir, "$fileName.tmp")
-
-        FileOutputStream(tempFile, false).use { output ->
-            input.copyTo(output)
-            output.fd.sync()
+        return if (writeAtomically(input, destFile)) {
+            "OK"
+        } else {
+            "ERROR:Unable to replace existing file ${destFile.absolutePath}"
         }
+    }
 
-        if (destFile.exists() && !destFile.delete()) {
-            tempFile.delete()
-            return "ERROR:Unable to replace existing file ${destFile.absolutePath}"
-        }
-
-        if (!tempFile.renameTo(destFile)) {
-            FileInputStream(tempFile).use { input ->
-                FileOutputStream(destFile, false).use { output ->
-                    input.copyTo(output)
-                    output.fd.sync()
-                }
+    private fun writeAtomically(input: InputStream, destination: File): Boolean {
+        // Use the same directory so rename can replace the target without deleting it first.
+        val tempFile = File.createTempFile(".dzm-", ".tmp", destination.parentFile)
+        return try {
+            FileOutputStream(tempFile, false).use { output ->
+                input.copyTo(output)
+                output.fd.sync()
             }
+            tempFile.renameTo(destination)
+        } finally {
             tempFile.delete()
         }
-
-        return "OK"
     }
 
     override fun zipHasExistingFiles(source: IFileSource?, targetDir: String?): Boolean {
@@ -130,7 +125,6 @@ class FileUserService : IFileService.Stub {
                 }
                 val canonicalRoot = destRoot.canonicalPath
                 var entryCount = 0
-                val buffer = ByteArray(16 * 1024)
                 while (true) {
                     val entry = zis.nextEntry ?: break
                     val cleanName = entry.name.trimStart('/')
@@ -170,29 +164,9 @@ class FileUserService : IFileService.Stub {
                             }
                         }
 
-                        val tempTarget = File(parent ?: destRoot, "${outFile.name}.tmp")
-                        FileOutputStream(tempTarget, false).use { output ->
-                            while (true) {
-                                val read = zis.read(buffer)
-                                if (read <= 0) break
-                                output.write(buffer, 0, read)
-                            }
-                            output.fd.sync()
-                        }
-
-                        if (outFile.exists() && !outFile.delete()) {
-                            tempTarget.delete()
+                        if (!writeAtomically(zis, outFile)) {
                             zis.closeEntry()
                             return "ERROR:Unable to replace ${outFile.absolutePath}"
-                        }
-                        if (!tempTarget.renameTo(outFile)) {
-                            FileInputStream(tempTarget).use { input ->
-                                FileOutputStream(outFile, false).use { output ->
-                                    input.copyTo(output)
-                                    output.fd.sync()
-                                }
-                            }
-                            tempTarget.delete()
                         }
                     }
                     zis.closeEntry()

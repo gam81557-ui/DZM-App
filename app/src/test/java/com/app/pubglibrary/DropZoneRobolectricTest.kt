@@ -413,6 +413,79 @@ class DropZoneRobolectricTest {
     }
 
     @Test
+    fun `file application preserves adjacent temporary filenames`() {
+        val root = createTempDirectory(prefix = "dropzone_temp_collision").toFile()
+        try {
+            val target = File(root, "target").apply { mkdirs() }
+            val existing = File(target, "settings.ini").apply { writeText("OLD_SETTINGS") }
+            val neighbor = File(target, "settings.ini.tmp").apply { writeText("KEEP_NEIGHBOR") }
+            val source = DownloadFileSource("NEW_SETTINGS".byteInputStream())
+            assertEquals("OK", FileUserService().copyFile(source, target.absolutePath, existing.name))
+            assertEquals("NEW_SETTINGS", existing.readText())
+            assertEquals("KEEP_NEIGHBOR", neighbor.readText())
+            assertEquals(setOf(existing.name, neighbor.name), target.list()!!.toSet())
+
+            val pak = File(target, "game.pak").apply { writeText("OLD_PAK") }
+            val pakNeighbor = File(target, "game.pak.tmp").apply { writeText("KEEP_PAK_NEIGHBOR") }
+            val archive = ByteArrayOutputStream()
+            ZipOutputStream(archive).use { zip ->
+                zip.putNextEntry(ZipEntry("game.pak"))
+                zip.write("NEW_PAK".toByteArray())
+                zip.closeEntry()
+            }
+            val result = archive.toByteArray().inputStream().use {
+                FileUserService().extractZip(DownloadFileSource(it), target.absolutePath)
+            }
+            assertEquals("OK", result)
+            assertEquals("NEW_PAK", pak.readText())
+            assertEquals("KEEP_PAK_NEIGHBOR", pakNeighbor.readText())
+            assertEquals(setOf(existing.name, neighbor.name, pak.name, pakNeighbor.name), target.list()!!.toSet())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `file application preserves a destination directory and cleans up on failure`() {
+        val root = createTempDirectory(prefix = "dropzone_temp_failure").toFile()
+        try {
+            val target = File(root, "target").apply { mkdirs() }
+            val destination = File(target, "settings.ini").apply { mkdirs() }
+            val contents = File(destination, "keep").apply { writeText("KEEP") }
+            val result = FileUserService().copyFile(
+                DownloadFileSource("NEW_SETTINGS".byteInputStream()), target.absolutePath, destination.name
+            )
+            assertTrue(result.startsWith("ERROR:"))
+            assertEquals("KEEP", contents.readText())
+            assertEquals(setOf(destination.name), target.list()!!.toSet())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `failed file stream leaves existing target untouched and removes staging file`() {
+        val root = createTempDirectory(prefix = "dropzone_interrupted_copy").toFile()
+        try {
+            val destination = File(root, "settings.ini").apply { writeText("ORIGINAL") }
+            val source = object : IFileSource.Stub() {
+                var calls = 0
+                override fun read(maxBytes: Int): ByteArray {
+                    if (calls++ == 0) return "INCOMPLETE".toByteArray()
+                    throw java.io.IOException("Stream interrupted")
+                }
+            }
+
+            val result = FileUserService().copyFile(source, root.absolutePath, destination.name)
+            assertTrue(result.startsWith("ERROR:"))
+            assertEquals("ORIGINAL", destination.readText())
+            assertEquals(setOf(destination.name), root.list()!!.toSet())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `extractZip blocks zip slip traversal paths`() {
         val tempRoot = createTempDirectory(prefix = "dropzone_zipslip_test").toFile()
         try {
